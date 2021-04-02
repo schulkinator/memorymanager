@@ -189,6 +189,7 @@ void* MemoryManager::Allocate(size_t size) {
     arena_collection = reinterpret_cast<ArenaCollection*>(calloc(1, sizeof(ArenaCollection)));
     arena_collection->cell_size_bytes = cell_size_without_header;
     arena_collection->sandbox = thread_sandbox;
+    arena_collection->derelict = false;
     thread_sandbox->arenas[arena_index] = arena_collection;
     arena_header = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
     arena_collection->first = arena_header;
@@ -385,6 +386,7 @@ MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(Thread
   thread_sandbox->arenas = reinterpret_cast<ArenaCollection**>(calloc(arenas_needed, sizeof(ArenaCollection*)));
   thread_sandbox->num_arena_sizes = arenas_needed;
   thread_sandbox->thread_id = thread_id;
+  thread_sandbox->derelict = false;
   // because we malloc the thread sanbox we need to manually call the constructors of our member objects by doing a placement new
   new (&thread_sandbox->dealloc_mutex) (std::mutex);
   new (&thread_sandbox->num_deallocs_queued) (std::atomic<unsigned int>);
@@ -419,6 +421,7 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   arena_header->padding_size_bytes = (alignment_bytes - masked_addr_past_header) % alignment_bytes;
   arena_header->arena_start = raw_arena + header_size + arena_header->padding_size_bytes;
   arena_header->arena_end = arena_header->arena_start + ((sizeof(CellHeader) + cell_size_without_header_bytes) * cell_capacity) - 1;
+  arena_header->derelict = false;
   arena_header->dummy_guard = VALID_ARENA_HEADER_MARKER;
   // stamp down pointers to the arena header in every cell header so that deallocation is speedy
   for (int i = 0; i < cell_capacity; ++i) {
@@ -450,15 +453,50 @@ void MemoryManager::ThreadShutdown() {
       continue;
     }
     ArenaHeader* arena_header = arena_collection->first;
+    arena_collection->first = nullptr; // null this out first so we can check if we have wired up a derelict
+    ArenaHeader* arena_header_curr_derelict = nullptr; // keep track of the most recent derelict encountered
     while (arena_header) {
-      ArenaHeader* next_arena_header = arena_header->next;
-      free(arena_header);
-      arena_header = next_arena_header;
+      if (arena_header->num_cells_occupied == 0) {
+        // destroy that arena
+        ArenaHeader* next_arena_header = arena_header->next;
+        free(arena_header);
+        arena_header = next_arena_header;        
+      } else {
+        // DERELICT!
+        // uh oh, we have encountered some derelict memory. 
+        // Someone didn't deallocate before the thread exited (usually caused by static destructors)
+        // now we need to mark the hierarchy as derelict and keep this link intact.
+        MEM_MGR_LOG("Encountered derelict memory on thread %d", thread_id);
+        if (!arena_collection->first) {
+          // wire it up as the new head of the linked list if none present
+          arena_collection->first = arena_header;
+        }
+        if (arena_header_curr_derelict) {
+          // wire the derelicts to link together
+          arena_header_curr_derelict->next = arena_header;
+        }
+        arena_header_curr_derelict = arena_header;
+        arena_header->derelict = true;
+        arena_collection->derelict = true;
+        thread_sandbox->derelict = true;        
+        arena_header = arena_header->next;
+      }      
     }
-    free(arena_collection);
-    thread_sandbox->arenas[i] = nullptr;
+    // make sure the terminating arena in a derelict scenario has a null next pointer
+    if (arena_header_curr_derelict) {
+      arena_header_curr_derelict->next = nullptr;
+    }
+    if (!arena_collection->derelict) {
+      free(arena_collection);
+      thread_sandbox->arenas[i] = nullptr;
+    }    
+  }
+  // at this point if this is derelict thread memory then we don't proceed with the rest of the teardown for this thread
+  if (thread_sandbox->derelict) {
+    return;
   }
   {
+    // deallocate the dealloc_queue for this thread
     // we need to mess with the queue for this sandbox, so lock the dealloc queue mutex
     std::lock_guard<std::mutex> guard(thread_sandbox->dealloc_mutex);
     free(thread_sandbox->dealloc_queue);

@@ -71,8 +71,10 @@ public:
     // the number of different sizes of arenas we have
     // this is essentially the length of the arenas array below
     unsigned int num_arena_sizes;
-    // arenas is a 1-dimensional array of pointers where the first dimension represents arena size (powers of two doubling every time)
-    // the contents of which is a pointer to the head of a linked list of arenas
+    // arenas is a 1-dimensional array of pointers where the first dimension represents arena size (powers of two doubling for every slot)
+    // the contents of which is a pointer to an ArenaCollection which holds the head of a linked list of arenas. This array is fixed in size up to the maximum
+    // number of arena sizes we support (controlled by MAX_CELL_SIZE). It is allocated at startup, and nullified. 
+    // It is a sparse array, so only indices which have had allocations will have a non-null ArenaCollection pointer.
     ArenaCollection** arenas;
     ThreadSandboxNode* next;
     // other threads can request to make a deallocation on this thread
@@ -81,6 +83,14 @@ public:
     std::atomic<unsigned int> num_deallocs_queued;
     std::atomic<unsigned int> deallocs_capacity;
     DeallocRequest* dealloc_queue; // this is a dynamic array of dealloc requests (can resize and grow larger if capacity runs out)
+    // derelict memory happens when the thread exits and cleanup begins but there are still occupied cells.
+    // This is usually caused by static constructors/destructors that will race with the thread sandbox destructor.
+    // Unfortunately their order of execution is not reliable, so we just allow the memory to leak. 
+    // The process is exiting anyway in that case so it shouldn't be that big of a deal.
+    // This is good motivation to avoid using static destructors in your code, but not the end of the world.
+    // If it happens We mark the entire memory hierarchy as derelict, except for cells, 
+    // to speed up checks for that case. (see ArenaCollection and ArenaHeader)
+    bool derelict;
   };
 
   struct ArenaHeader;
@@ -98,6 +108,8 @@ public:
     ArenaHeader* recent_dealloc_arena;
     // points to an arena which recently had a cell allocation
     ArenaHeader* recent_alloc_arena;
+    // is this memory derelict? (see ThreadSandboxNode for definition of the term derelict memory)
+    bool derelict;
   };
 
   // A contiguous chunk of memory which contains individual cells of memory
@@ -118,8 +130,10 @@ public:
     // arena_end will point to the last byte of the last cell in the arena
     unsigned char* arena_end;
     ArenaHeader* next;
+    // is this memory derelict? (see ThreadSandboxNode for definition of the term derelict memory)
+    bool derelict;
     // just occupies 8 bytes as a guard and as an integrity verification
-    unsigned long long dummy_guard;
+    unsigned long long dummy_guard;    
   };
 
   // A single block of memory that is intended to be the smallest atomic unit for allocation managed by the memory manager.
