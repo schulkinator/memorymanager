@@ -1,5 +1,5 @@
 # memorymanager
-A simple, thread-safe memory manager for C++ applications and games. Focus is on preventing fragmentation in the absence of good virtual memory management, at the cost of wasting some memory. It works by globally overriding the new and delete operators.
+A simple, thread-safe memory manager for C++ applications and games. Focus is on preventing fragmentation in the absence of good virtual memory management, at the cost of wasting some memory. It works by globally overriding the new and delete operators, so it "just works" as long as you use new and delete. No dependencies or special libraries required except the standard C++11 headers.
 
 Example layout of the memory hierarchy within a single thread sandbox
 
