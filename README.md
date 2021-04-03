@@ -3,7 +3,11 @@ A simple, cross-platform, thread-safe memory manager for C++ applications and ga
 
 It attempts to keep allocations as contiguous in memory as possible by allocating memory arenas, which contain cells of memory. Deallocation is achieved by simply marking cells as "unoccupied" again. Actual free()-ing of memory back to the system is a rare event, so overall system memory use will tend to go up but seldomly go down as the memory manager holds on to this previously malloc()-ed memory to use for future allocations. Below is an example layout of the memory hierarchy within a single thread sandbox
 
-![MemoryManager_toplevel](https://user-images.githubusercontent.com/14068824/113448154-23423200-93b0-11eb-9b6a-321815e12367.png)
+![MemoryManager_toplevel](https://user-images.githubusercontent.com/14068824/113484457-37903880-945d-11eb-985c-90c3fa4584df.png)
+
+Here is a detailed view of a single arena example. Notice that the whole block is one contiguous chunk of memory, including the header. Each arena has a specific capacity based on the cell size it contains. All cells in an arena are the same size. The capacity is determined based on the maximum arena size and the cell size. The capacity can be no larger than 64 cells however, just so that we can track occupancy in a single 64 bit integer bitfield.
+
+![MemoryManager_arena](https://user-images.githubusercontent.com/14068824/113484861-6ad3c700-945f-11eb-94d8-a7506e147a63.png)
 
 
 The quickest way to use it with visual studio is to simply add the .h and .cpp files to your visual studio project alongside your source code.
