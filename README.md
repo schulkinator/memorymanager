@@ -5,7 +5,7 @@ It attempts to keep allocations as contiguous in memory as possible by allocatin
 
 ![MemoryManager_toplevel](https://user-images.githubusercontent.com/14068824/113484457-37903880-945d-11eb-985c-90c3fa4584df.png)
 
-Here is a detailed view of a single arena example. Notice that the whole block is one contiguous chunk of memory, including the header. Each arena has a specific capacity based on the cell size it contains. All cells in an arena are the same size. The capacity is determined based on the maximum arena size and the cell size. The capacity can be no larger than 64 cells however, just so that we can track occupancy in a single 64 bit integer bitfield.
+Here is a detailed view of a single arena example. Notice that the whole block is one contiguous chunk of memory, including the header. Each arena has a specific capacity based on the cell size it contains. All cells in an arena are the same size. The cell capacity is determined based on the maximum arena size and the cell size. The cell capacity can be no larger than 64 cells, just so that we can track occupancy in a single 64 bit integer bitfield.
 
 ![MemoryManager_arena](https://user-images.githubusercontent.com/14068824/113484861-6ad3c700-945f-11eb-94d8-a7506e147a63.png)
 
