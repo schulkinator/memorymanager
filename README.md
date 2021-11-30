@@ -8,7 +8,7 @@ Terminology:
 "Arena" - A contiguous chunk of memory which contains individual cells of memory
 
 "Cell" - A single block of memory that is intended to be the smallest atomic unit for allocation managed by the memory manager. 
-         aka. the blocks used by application code
+         aka. the memory used by application code
 
 The Memory Manager attempts to keep allocations as contiguous in memory as possible by allocating memory arenas, which contain cells of memory. These "cells" of memory are what actually get reserved as the space for the call to new. Deallocation is achieved by simply marking cells as "unoccupied" again. Actual free()-ing of memory back to the system is a rare event, so overall system memory use will tend to go up but seldomly go down as the memory manager holds on to this previously malloc()-ed memory to use for future allocations. Below is an example layout of the memory hierarchy within a single thread sandbox
 
