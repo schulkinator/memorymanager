@@ -2,6 +2,7 @@
 A simple, cross-platform, thread-safe heap memory manager for C++ applications and games. Focus is on preventing fragmentation in the absence of good virtual memory management, at the cost of wasting a little bit of memory. It works by globally overriding the new and delete operators, so it "just works" as long as you use new and delete. No dependencies or special libraries required except the standard C++11 headers and windows headers if compiling on windows.
 
 Terminology: 
+
 "Thread Sandbox" - A thread sandbox is simply the working space of memory that only one specific thread can touch. There can be as many thread sanboxes as there are number of threads in the application. We do this mostly so that each thread can avoid synchronization contention when accessing the memory that it allocates.
 
 "Arena" - A contiguous chunk of memory which contains individual cells of memory
