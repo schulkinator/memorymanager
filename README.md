@@ -3,7 +3,7 @@ A simple, cross-platform, thread-safe heap memory manager for C++ applications a
 
 Terminology: 
 
-"Thread Sandbox" - A thread sandbox is simply the working space of memory that only one specific thread can touch. There can be as many thread sanboxes as there are number of threads in the application. We do this mostly so that each thread can avoid synchronization contention when accessing the memory that it allocates.
+"Thread Sandbox" - A thread sandbox is simply the working space of memory that only one specific thread can touch. There can be as many thread sanboxes as there are number of threads in the application. We do this mostly so that each thread can avoid synchronization contention when accessing the memory that it allocates. Contention only arises when threads try to deallocate memory that was previously allocated on another thread. Therefore we have to track memory "ownership" per thread.
 
 "Arena" - A contiguous chunk of memory which contains individual cells of memory
 
