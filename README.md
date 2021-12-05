@@ -18,7 +18,7 @@ Below is an example layout of the memory hierarchy within a single thread sandbo
 
 ![MemoryManager_toplevel](https://user-images.githubusercontent.com/14068824/113484457-37903880-945d-11eb-985c-90c3fa4584df.png)
 
-Below is an example detailed view of a single arena. Notice that the whole arena is one contiguous block of memory, including the header. Each arena has a specific capacity based on the cell size it contains. All cells in an arena are the same size. The cell capacity is determined based on the maximum arena size (defined by MAX_ARENA_SIZE) and the cell size for that arena. Additionally the cell capacity can be no larger than 64 cells, just so that we can track occupancy in a single 64 bit integer bitfield. So for example, if we have MAX_ARENA_SIZE set to 8MB, and we're allocating cells of size 2MB, then the arena will only contain 4 cells, each of size 2MB.
+Below is an example detailed view of a single arena. Notice that the whole arena is one contiguous block of memory, including the header. Each arena has a specific capacity based on the cell size it contains. All cells in an arena are the same size. The cell capacity is determined based on the maximum arena size (defined by MAX_ARENA_SIZE) and the cell size for that arena. Additionally the cell capacity can be no larger than 64 cells, just so that we can track occupancy in a single 64 bit integer bitfield. So for example, if we have MAX_ARENA_SIZE set to 8MB, and we're allocating cells of size 1MB, then the arena will only contain 8 cells, each of size 1MB.
 
 ![MemoryManager_arena](https://user-images.githubusercontent.com/14068824/113484861-6ad3c700-945f-11eb-94d8-a7506e147a63.png)
 
