@@ -65,7 +65,7 @@ public:
   struct ArenaCollection;
   struct DeallocRequest;
 
-  // A thread sandbox is simply the working space that only one specific thread can touch 
+  // A thread sandbox is simply the working memory space that only one specific thread can touch 
   struct ThreadSandboxNode {
     unsigned int thread_id;
     // the number of different sizes of arenas we have
@@ -83,9 +83,12 @@ public:
     std::atomic<unsigned int> num_deallocs_queued;
     std::atomic<unsigned int> deallocs_capacity;
     DeallocRequest* dealloc_queue; // this is a dynamic array of dealloc requests (can resize and grow larger if capacity runs out)
-    // derelict memory happens when the thread exits and cleanup begins but there are still occupied cells.
-    // This is usually caused by static constructors/destructors that will race with the thread sandbox destructor.
-    // Unfortunately their order of execution is not reliable, so we just allow the memory to leak. 
+    // Derelict memory happens when the thread exits and cleanup begins but there are still occupied cells.
+    // Derelict memory is bad because we can't confidently free it back to the OS because
+    // it may still be in use by application code.
+    // This can be caused by memory leaks (application bugs where there is an allocation without corresponding deallocation), 
+    // but it can also be caused by static constructors/destructors that will race with the thread sandbox destructor.
+    // Unfortunately static destructor order of execution is not reliable, so we just allow the memory to leak (dont free it). 
     // The process is exiting anyway in that case so it shouldn't be that big of a deal.
     // This is good motivation to avoid using static destructors in your code, but not the end of the world.
     // If it happens We mark the entire memory hierarchy as derelict, except for cells, 

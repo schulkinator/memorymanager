@@ -17,10 +17,6 @@
 #include <windows.h>
 #include <Processthreadsapi.h>
 #include <intrin.h>
-#ifdef _MSC_VER
-// for some reason __builtin_popcount isn't present on all windows machines
-#  define __builtin_popcount __popcnt
-#endif
 #endif
 
 // Memory allocation values
@@ -134,6 +130,10 @@ void* MemoryManager::Allocate(size_t size) {
     // beyond MAX_ALLOCATION_SIZE we don't care, we're more concerned about small allocations fragmenting memory    
     // stamp down a header to mark it as outside memory
     unsigned char* p = reinterpret_cast<unsigned char*>(malloc(size + BYTE_ALIGNMENT));
+    if (!p) {
+      // allocation failed
+      return nullptr;
+    }
     unsigned int* u = reinterpret_cast<unsigned int*>(p);
     *u = OUTSIDE_SYSTEM_MARKER;
     // advance past the marker
@@ -143,7 +143,7 @@ void* MemoryManager::Allocate(size_t size) {
   // allocations below the byte alignment size make no sense either (including zero size allocations)
   // But that will be enforced in the below CalculateCellSizeAndArenaIndexForAllocation()
   if (!thread_id) {
-    thread_id = GET_CURRENT_THREAD_ID();
+    thread_id = GET_CURRENT_THREAD_ID(); // TODO: can this be in the static init instead of here?
   }
   // The first sandbox in existence (the head of the list) is a special case, create it if it doesn't exist
   if (!thread_memory_sandboxes) {
@@ -153,6 +153,10 @@ void* MemoryManager::Allocate(size_t size) {
     // would need to not run this code
     if (!thread_memory_sandboxes) {
       thread_memory_sandboxes = (ThreadSandboxNode*)AllocateNewThreadSandbox(nullptr, thread_id);
+      if (!thread_memory_sandboxes) {
+        // thread sandbox allocation failed
+        return nullptr;
+      }
       thread_sandbox = thread_memory_sandboxes;
     }
   }
@@ -167,6 +171,10 @@ void* MemoryManager::Allocate(size_t size) {
     // only one thread at a time is allowed to make a new sandbox
     std::lock_guard<std::mutex> guard(sandbox_list_mutex);
     thread_sandbox = AllocateNewThreadSandbox(prev_sandbox, thread_id);
+    if (!thread_sandbox) {
+      // thread sandbox allocation failed
+      return nullptr;
+    }
   }
   // now we can process the sandbox
   // first, do we have any cross-thread dealloc requests to handle?
@@ -187,11 +195,19 @@ void* MemoryManager::Allocate(size_t size) {
   if (!arena_collection) {
     // no arena collection was allocated for this allocation size yet, allocate it now
     arena_collection = reinterpret_cast<ArenaCollection*>(calloc(1, sizeof(ArenaCollection)));
+    if (!arena_collection) {
+      // arena collection allocation failed
+      return nullptr;
+    }
     arena_collection->cell_size_bytes = cell_size_without_header;
     arena_collection->sandbox = thread_sandbox;
     arena_collection->derelict = false;
     thread_sandbox->arenas[arena_index] = arena_collection;
     arena_header = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
+    if (!arena_header) {
+      // the allocation failed
+      return nullptr;
+    }
     arena_collection->first = arena_header;
   }
   arena_header = arena_collection->first;
@@ -209,6 +225,10 @@ void* MemoryManager::Allocate(size_t size) {
     if (!arena_header->next) {
       // there's no next arena, allocate a new one
       arena_header->next = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
+      if (!arena_header->next) {
+        // the allocation failed
+        return nullptr;
+      }
     }
     arena_header = arena_header->next;
   }
@@ -371,6 +391,10 @@ void MemoryManager::Deallocate(void* data, size_t size) {
 
 MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id) {
   ThreadSandboxNode* thread_sandbox = reinterpret_cast<ThreadSandboxNode*>(calloc(1, sizeof(ThreadSandboxNode)));
+  if (!thread_sandbox) {
+    // allocation failed
+    return nullptr;
+  }
   if (tail_of_list) {
     tail_of_list->next = thread_sandbox;
   }
@@ -402,6 +426,9 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   // the alignment_bytes bytes here allow us to make sure we have room for byte alignment padding between the header and the data cells *wherever* the OS decides to give us memory
   // each cell contains: a pointer to the arena header, some guard padding, then the cell data itself
   unsigned char* raw_arena = reinterpret_cast<unsigned char*>(malloc(header_size + alignment_bytes + ((sizeof(CellHeader) + cell_size_without_header_bytes) * cell_capacity)));
+  if (!raw_arena) {
+    return nullptr;
+  }
   // zero out the header
   memset(raw_arena, 0, header_size);
   ArenaHeader* arena_header = reinterpret_cast<ArenaHeader*>(raw_arena);
@@ -424,7 +451,7 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   arena_header->derelict = false;
   arena_header->dummy_guard = VALID_ARENA_HEADER_MARKER;
   // stamp down pointers to the arena header in every cell header so that deallocation is speedy
-  for (int i = 0; i < cell_capacity; ++i) {
+  for (uint_fast16_t i = 0; i < cell_capacity; ++i) {
     unsigned char* cell_header_raw = (arena_header->arena_start + ((sizeof(CellHeader) + cell_size_without_header_bytes) * i));
     CellHeader* cell_header = reinterpret_cast<CellHeader*>(cell_header_raw);
     cell_header->arena_header = arena_header;
@@ -446,7 +473,7 @@ void MemoryManager::ThreadShutdown() {
     return;
   }
   // kill all the arenas for this thread
-  for (int i = 0; i < thread_sandbox->num_arena_sizes; ++i) {
+  for (uint32_t i = 0; i < thread_sandbox->num_arena_sizes; ++i) {
     ArenaCollection* arena_collection = thread_sandbox->arenas[i];
     // its totally valid (and intentional) for arena collections to be left null, so avoid that
     if (!arena_collection) {

@@ -1,0 +1,33 @@
+# Compiled/generated #
+# note that I'm not putting dlls here #
+########################
+[Dd]ebug/
+[Rr]elease/
+x64/
+*.obj
+*.ipch
+*.sdf
+*.db
+*.exe
+*.pdb
+*.pch
+*.vs
+*.ktx
+*.lib
+*.dll
+*.user
+
+
+# machine-specific config #
+###########################
+*.suo
+
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
