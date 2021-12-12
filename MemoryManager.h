@@ -31,6 +31,10 @@ SOFTWARE.
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#ifdef _WIN32
+// visual studio will complain about mismatching annotations for new operator. not relevant for all C++ implementations
+#pragma warning(disable : 28251)
+#endif
 // The Memory Manager handles preventing fragmentation of memory for systems with a lack of good virtual memory management.
 // It globally overrides the new and delete c++ operators (but not malloc/free).
 // It values performance speed over optimal space efficiency (some space will be wasted).
@@ -40,16 +44,27 @@ SOFTWARE.
 // it is about 3x slower than standard allocation, but 2x faster than standard deallocation.
 
 // Terminology: 
-// "Thread Sandbox" - A thread sandbox is simply the working space of memory that only one specific thread can touch 
+// "Thread Sandbox" - A thread sandbox is simply the working space of memory that only one specific thread can touch. 
+//    There can be as many thread sanboxes as there are number of threads in the application. 
+//    We do this mostly so that each thread can avoid synchronization contention when accessing the memory that it allocates. 
+//    Contention only arises when threads try to deallocate memory that was previously allocated on another thread. 
+//    Therefore we have to track memory "ownership" per thread.
 // "Arena" - A contiguous chunk of memory which contains individual cells of memory
 // "Cell" - A single block of memory that is intended to be the smallest atomic unit for allocation managed by the memory manager. 
 //          aka. the blocks used by outside code
 
 #ifdef ENABLE_MEMORY_MANAGEMENT
-void* operator new(size_t size);
+
+// default new operator throws the bad_alloc exception upon failure
 void* operator new(size_t size) throw(std::bad_alloc);
-void* operator new[](size_t size);
+// to use this non-exception-throwing version of new you must explicitly call it, ie:
+// Object* p = new (std::nothrow) Object();
+void* operator new(size_t size, const std::nothrow_t&) noexcept;
+// default new operator throws the bad_alloc exception upon failure
 void* operator new[](size_t size) throw(std::bad_alloc);
+// to use this non-exception-throwing version of new[] you must explicitly call it, ie:
+// char* p = new (std::nothrow) char [1024];
+void* operator new[](size_t size, const std::nothrow_t&) noexcept;
 
 void operator delete(void* p);
 void operator delete(void*, size_t size);
@@ -153,8 +168,11 @@ public:
     size_t size;
   };
 
-  static void* Allocate(size_t size);
+  static void* Allocate(size_t size, void (*error_handler)());
   static void Deallocate(void* data, size_t size);
+
+  static void HandleErrorThrow();
+  static void HandleErrorNoThrow() noexcept;
 
   static ThreadSandboxNode* AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id);
   static inline ThreadSandboxNode* FindSandboxForThread(unsigned int thread_id, ThreadSandboxNode*& last_node);
@@ -177,8 +195,9 @@ public:
 
   // Unit tests
   static void Test_StandardAllocDealloc();
-  static void Test_CrossThreadAllocDealloc();    
-  static void PerfTest_AllocDealloc();
+  static void Test_CrossThreadAllocDealloc();
+  static void Test_ErrorHandling();
+  static void PerfTest_AllocDealloc();  
 
 private:
   ////// Global state across all threads ////////

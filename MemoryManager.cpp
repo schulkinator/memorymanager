@@ -17,6 +17,8 @@
 #include <windows.h>
 #include <Processthreadsapi.h>
 #include <intrin.h>
+// visual studio will complain about mismatching annotations for new operator. not relevant for all C++ implementations
+#pragma warning(disable : 28251)
 #endif
 
 // Memory allocation values
@@ -72,15 +74,30 @@
 
 
 #ifdef ENABLE_MEMORY_MANAGEMENT
-void* operator new(size_t size) {
-  void* r = MemoryManager::Allocate(size);
+
+
+// default std::bad_alloc exception throwing version
+void* operator new(size_t size) throw(std::bad_alloc) {
+  void* r = MemoryManager::Allocate(size, MemoryManager::HandleErrorThrow);
   return r;
 }
 
-void* operator new[](size_t size) {
-  void* r = MemoryManager::Allocate(size);
+void* operator new(size_t size, const std::nothrow_t&) noexcept {
+  void* r = MemoryManager::Allocate(size, MemoryManager::HandleErrorNoThrow);
   return r;
 }
+
+// default std::bad_alloc exception throwing version
+void* operator new[](size_t size) throw(std::bad_alloc) {
+  void* r = MemoryManager::Allocate(size, MemoryManager::HandleErrorThrow);
+  return r;
+}
+
+void* operator new[](size_t size, const std::nothrow_t&) noexcept {
+  void* r = MemoryManager::Allocate(size, MemoryManager::HandleErrorNoThrow);
+  return r;
+}
+
 
 void operator delete(void* data) {
   MemoryManager::Deallocate(data, 0);
@@ -99,6 +116,13 @@ void operator delete[](void* p) {
 }
 #endif
 
+void MemoryManager::HandleErrorThrow() {
+  throw std::bad_alloc();
+}
+
+void MemoryManager::HandleErrorNoThrow() noexcept {
+  // NO-OP
+}
 
 // Linked list of sandboxes, one per thread.
 // For threading each thread gets its own collection of memory arenas to manage in parallel. This reduces mutex locking overhead.
@@ -125,13 +149,14 @@ public:
 } mm_thread_destructor;
 
 
-void* MemoryManager::Allocate(size_t size) {
+void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   if (size > MAX_CELL_SIZE) {
     // beyond MAX_ALLOCATION_SIZE we don't care, we're more concerned about small allocations fragmenting memory    
     // stamp down a header to mark it as outside memory
     unsigned char* p = reinterpret_cast<unsigned char*>(malloc(size + BYTE_ALIGNMENT));
     if (!p) {
       // allocation failed
+      error_handler();
       return nullptr;
     }
     unsigned int* u = reinterpret_cast<unsigned int*>(p);
@@ -155,6 +180,7 @@ void* MemoryManager::Allocate(size_t size) {
       thread_memory_sandboxes = (ThreadSandboxNode*)AllocateNewThreadSandbox(nullptr, thread_id);
       if (!thread_memory_sandboxes) {
         // thread sandbox allocation failed
+        error_handler();
         return nullptr;
       }
       thread_sandbox = thread_memory_sandboxes;
@@ -173,6 +199,7 @@ void* MemoryManager::Allocate(size_t size) {
     thread_sandbox = AllocateNewThreadSandbox(prev_sandbox, thread_id);
     if (!thread_sandbox) {
       // thread sandbox allocation failed
+      error_handler();
       return nullptr;
     }
   }
@@ -193,12 +220,14 @@ void* MemoryManager::Allocate(size_t size) {
   ArenaCollection* arena_collection = thread_sandbox->arenas[arena_index];
   ArenaHeader* arena_header = nullptr;
   if (!arena_collection) {
-    // no arena collection was allocated for this allocation size yet, allocate it now
+    // no arena collection was allocated for this allocation size yet, allocate it now    
+    // since we use calloc, everything will be zero initialized for us
     arena_collection = reinterpret_cast<ArenaCollection*>(calloc(1, sizeof(ArenaCollection)));
     if (!arena_collection) {
       // arena collection allocation failed
+      error_handler();
       return nullptr;
-    }
+    }    
     arena_collection->cell_size_bytes = cell_size_without_header;
     arena_collection->sandbox = thread_sandbox;
     arena_collection->derelict = false;
@@ -206,6 +235,7 @@ void* MemoryManager::Allocate(size_t size) {
     arena_header = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
     if (!arena_header) {
       // the allocation failed
+      error_handler();
       return nullptr;
     }
     arena_collection->first = arena_header;
@@ -227,6 +257,7 @@ void* MemoryManager::Allocate(size_t size) {
       arena_header->next = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
       if (!arena_header->next) {
         // the allocation failed
+        error_handler();
         return nullptr;
       }
     }
@@ -362,6 +393,7 @@ void MemoryManager::Deallocate(void* data, size_t size) {
       }
       else {
         // very first queue alloc
+        // since we use calloc, everything will be zero initialized for us
         new_queue = reinterpret_cast<DeallocRequest*>(calloc(new_capacity, sizeof(DeallocRequest)));
       }
       if (!new_queue) {
@@ -390,6 +422,7 @@ void MemoryManager::Deallocate(void* data, size_t size) {
 }
 
 MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id) {
+  // since we use calloc, everything will be zero initialized for us
   ThreadSandboxNode* thread_sandbox = reinterpret_cast<ThreadSandboxNode*>(calloc(1, sizeof(ThreadSandboxNode)));
   if (!thread_sandbox) {
     // allocation failed
@@ -407,6 +440,7 @@ MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(Thread
   unsigned int ignore_first_n = ((log(BYTE_ALIGNMENT) / log(2.0f)) - 1);
   arenas_needed -= ignore_first_n;
   // now we know how many arenas we need, allocate the array of pointers to their collections
+  // since we use calloc, everything will be zero initialized for us
   thread_sandbox->arenas = reinterpret_cast<ArenaCollection**>(calloc(arenas_needed, sizeof(ArenaCollection*)));
   thread_sandbox->num_arena_sizes = arenas_needed;
   thread_sandbox->thread_id = thread_id;
@@ -703,6 +737,31 @@ void MemoryManager::Test_CrossThreadAllocDealloc() {
   t1.join();
 }
 
+void MemoryManager::Test_ErrorHandling() {  
+  // first find our thread sandbox
+  ThreadSandboxNode* prev_sandbox = nullptr;
+  if (!thread_id) {
+    thread_id = GET_CURRENT_THREAD_ID();
+  }
+  // make an extremely large alloc with the default (exception throwing) version of new
+  try {
+    int64_t huge = 1000000000000000;
+    char* c = new char[huge];
+    assert(false); // we should never reach this if the exception was thrown
+  } catch (std::bad_alloc e) {
+    // good, we caught the exception
+  }
+  // make an extremely large alloc with the non-throwing version of new
+  try {
+    int64_t huge = 1000000000000000;
+    char* c = new (std::nothrow) char[huge];
+    assert(c == nullptr);
+  }
+  catch (std::bad_alloc e) {
+    assert(false); // we should never reach this since no exceptions should be thrown
+  }
+}
+
 void MemoryManager::PerfTest_AllocDealloc() {
   struct MMTestStructTiny {
     uint64_t thing1;
@@ -738,4 +797,3 @@ void MemoryManager::PerfTest_AllocDealloc() {
   }
   MEM_MGR_LOG("Alloc test took %lld microseconds, dealloc test took %lld microseconds. longest alloc time was %lld and shortest alloc time was %lld", alloc_time.count(), dealloc_time.count(), longest_alloc_time, shortest_alloc_time);
 }
-
