@@ -23,6 +23,6 @@ Below is an example detailed view of a single arena. Notice that the whole arena
 ![MemoryManager_arena](https://user-images.githubusercontent.com/14068824/113484861-6ad3c700-945f-11eb-94d8-a7506e147a63.png)
 
 
-The quickest way to use it with visual studio is to simply add the .h and .cpp files to your visual studio project alongside your source code. You can even put it in a subdirectory or parent directory and then in your visual studio project settings add an include path relative to your project with $(ProjectDir)/memorymanager for example. Then using the same relative path, add the source and header file to your solution explorer "Source Files" or "Header Files" filter. You should be good to go.
+The quickest way to use it with visual studio is to simply add the .h and .cpp files to your visual studio project alongside your source code. You can even put it in a subdirectory or parent directory and then in your visual studio project settings add an include path relative to your project with $(ProjectDir)/memorymanager for example. Then using the same relative path you can "add existing" with the source and header file to your solution explorer "Source Files" or "Header Files" filter. You should be good to go.
 
 Unit tests are included in the source as indicated. The included VS solution has a project inside it to run the tests.
