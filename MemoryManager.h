@@ -31,7 +31,9 @@ SOFTWARE.
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
-#ifdef _WIN32
+#if _MSC_VER >= 1200
+// visual studio specific compiler warnings
+#pragma warning( push )
 // visual studio will complain about mismatching annotations for new operator. not relevant for all C++ implementations
 #pragma warning(disable : 28251)
 #endif
@@ -55,22 +57,22 @@ SOFTWARE.
 
 #ifdef ENABLE_MEMORY_MANAGEMENT
 
-// default new operator throws the bad_alloc exception upon failure
-void* operator new(size_t size) throw(std::bad_alloc);
+// default new operator throws the std::bad_alloc exception upon failure
+void* operator new(size_t size);
 // to use this non-exception-throwing version of new you must explicitly call it, ie:
 // Object* p = new (std::nothrow) Object();
 void* operator new(size_t size, const std::nothrow_t&) noexcept;
-// default new operator throws the bad_alloc exception upon failure
-void* operator new[](size_t size) throw(std::bad_alloc);
+// default new operator throws the std::bad_alloc exception upon failure
+void* operator new[](size_t size);
 // to use this non-exception-throwing version of new[] you must explicitly call it, ie:
 // char* p = new (std::nothrow) char [1024];
 void* operator new[](size_t size, const std::nothrow_t&) noexcept;
 
 void operator delete(void* p);
 void operator delete(void*, size_t size);
-void operator delete(void*, size_t size) throw();
+void operator delete(void*, size_t size, const std::nothrow_t&) noexcept;
 void operator delete[](void*, size_t size);
-void operator delete[](void* p, size_t size) throw();
+void operator delete[](void* p, size_t size, const std::nothrow_t) noexcept;
 void operator delete[](void* p);
 #endif
 
@@ -154,8 +156,8 @@ public:
     unsigned long long dummy_guard;    
   };
 
-  // A single block of memory that is intended to be the smallest atomic unit for allocation managed by the memory manager.
-  //          aka. the blocks used by outside code
+  // Header for a single block of memory that is intended to be the smallest atomic unit for allocation managed by the memory manager.
+  //          aka. the blocks used by application code
   struct CellHeader {
     // pointer to this cell's arena header
     ArenaHeader* arena_header;
@@ -171,8 +173,11 @@ public:
   static void* Allocate(size_t size, void (*error_handler)());
   static void Deallocate(void* data, size_t size);
 
-  static void HandleErrorThrow();
-  static void HandleErrorNoThrow() noexcept;
+  static void HandleAllocErrorThrow();
+  static void HandleAllocErrorNoThrow() noexcept;
+
+  static void ClearAllocErrors();
+  static void ClearDeallocErrors();
 
   static ThreadSandboxNode* AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id);
   static inline ThreadSandboxNode* FindSandboxForThread(unsigned int thread_id, ThreadSandboxNode*& last_node);
@@ -186,7 +191,7 @@ public:
   static void ThreadShutdown();
 
   //There is one additional wrinkle: Even though we keep thread memory sandboxes separate, one thread may try to delete memory in another thread sandbox.
-  //In this case we need put the delete request from the alien thread on a queue and then process it on the local thread at a later time.
+  //In this case we need to put the delete request from the alien thread on a queue and then process it on the local thread at a later time.
   //Access to this queue MUST be synchronized with a mutex.
   // We operate with the observations:
   //a) often the object is freed by the same thread that had allocated it, and
@@ -210,5 +215,10 @@ private:
   static thread_local unsigned int mm_dealloc_error_status; /* nonzero means error */
   static thread_local unsigned int mm_alloc_error_status; /* nonzero means error */    
 };
+
+#if _MSC_VER >= 1200
+// visual studio specific compiler warnings
+#pragma warning ( pop )
+#endif
 
 #endif

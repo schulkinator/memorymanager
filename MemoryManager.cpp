@@ -17,6 +17,10 @@
 #include <windows.h>
 #include <Processthreadsapi.h>
 #include <intrin.h>
+#endif
+
+#if _MSC_VER >= 1200
+// visual studio specific compiler warnings
 // visual studio will complain about mismatching annotations for new operator. not relevant for all C++ implementations
 #pragma warning(disable : 28251)
 #endif
@@ -40,6 +44,13 @@
   #define COUNT_NUM_TRAILING_ZEROES(bits) __builtin_ctz(bits)
 #endif
 
+// Macro to count the leading number of zeros before the most significant bit.
+#if defined _M_X64 || defined _M_IX86 || defined __x86_64__
+  #define COUNT_NUM_LEADING_ZEROES(bits) _lzcnt_u32(bits) /* This is an x86 specific BMI instruction intrinsic */
+#else
+  #define COUNT_NUM_LEADING_ZEROES(bits) __builtin_clzl(bits)
+#endif
+
 // Calculate the next highest power of 2 from the given number n (assumes integer types)
 #define NEXT_POW2(n) \
 (n)--; \
@@ -49,6 +60,14 @@
 (n) |= (n) >> 8; \
 (n) |= (n) >> 16; \
 (n)++;
+
+// intrinsic based version for 64bit uint
+#define NEXT_POW2_UINT64(n) \
+n == 1 ? 1 : 1<<(64-COUNT_NUM_LEADING_ZEROES(n-1))
+
+// intrinsic based version for 32bit uint
+#define NEXT_POW2_UINT32(n) \
+n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES(n-1))
 
 // Threading macros
 #if _WIN32
@@ -77,24 +96,24 @@
 
 
 // default std::bad_alloc exception throwing version
-void* operator new(size_t size) throw(std::bad_alloc) {
-  void* r = MemoryManager::Allocate(size, MemoryManager::HandleErrorThrow);
+void* operator new(size_t size) {
+  void* r = MemoryManager::Allocate(size, MemoryManager::HandleAllocErrorThrow);
   return r;
 }
 
 void* operator new(size_t size, const std::nothrow_t&) noexcept {
-  void* r = MemoryManager::Allocate(size, MemoryManager::HandleErrorNoThrow);
+  void* r = MemoryManager::Allocate(size, MemoryManager::HandleAllocErrorNoThrow);
   return r;
 }
 
 // default std::bad_alloc exception throwing version
-void* operator new[](size_t size) throw(std::bad_alloc) {
-  void* r = MemoryManager::Allocate(size, MemoryManager::HandleErrorThrow);
+void* operator new[](size_t size) {
+  void* r = MemoryManager::Allocate(size, MemoryManager::HandleAllocErrorThrow);
   return r;
 }
 
 void* operator new[](size_t size, const std::nothrow_t&) noexcept {
-  void* r = MemoryManager::Allocate(size, MemoryManager::HandleErrorNoThrow);
+  void* r = MemoryManager::Allocate(size, MemoryManager::HandleAllocErrorNoThrow);
   return r;
 }
 
@@ -107,7 +126,15 @@ void operator delete(void* data, size_t size) {
   MemoryManager::Deallocate(data, size);
 }
 
+void operator delete(void* data, size_t size, const std::nothrow_t&) noexcept {
+  MemoryManager::Deallocate(data, size);
+}
+
 void operator delete[](void* data, size_t size) {
+  MemoryManager::Deallocate(data, size);
+}
+
+void operator delete[](void* data, size_t size, const std::nothrow_t&) noexcept {
   MemoryManager::Deallocate(data, size);
 }
 
@@ -116,12 +143,21 @@ void operator delete[](void* p) {
 }
 #endif
 
-void MemoryManager::HandleErrorThrow() {
+void MemoryManager::HandleAllocErrorThrow() {
+  mm_alloc_error_status = 1;
   throw std::bad_alloc();
 }
 
-void MemoryManager::HandleErrorNoThrow() noexcept {
-  // NO-OP
+void MemoryManager::HandleAllocErrorNoThrow() noexcept {
+  mm_alloc_error_status = 1;
+}
+
+void MemoryManager::ClearAllocErrors() {
+  mm_alloc_error_status = 0;
+}
+
+void MemoryManager::ClearDeallocErrors() {
+  mm_dealloc_error_status = 0;
 }
 
 // Linked list of sandboxes, one per thread.
@@ -150,7 +186,10 @@ public:
 
 
 void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
-  if (size > MAX_CELL_SIZE) {
+  if (size == 0) {
+    return nullptr;
+  }
+  else if (size > MAX_CELL_SIZE) {
     // beyond MAX_ALLOCATION_SIZE we don't care, we're more concerned about small allocations fragmenting memory    
     // stamp down a header to mark it as outside memory
     unsigned char* p = reinterpret_cast<unsigned char*>(malloc(size + BYTE_ALIGNMENT));
@@ -286,9 +325,9 @@ inline unsigned int MemoryManager::CalculateCellSizeAndArenaIndexForAllocation(s
   if (allocation_size < BYTE_ALIGNMENT) {
     allocation_size = BYTE_ALIGNMENT;
   }
-  size_t alloc_npow2 = allocation_size;
-  NEXT_POW2(alloc_npow2)
-  unsigned int cell_size_without_header = alloc_npow2;
+  uint32_t alloc_npow2 = static_cast<uint32_t>(allocation_size);
+  alloc_npow2 = NEXT_POW2_UINT32(alloc_npow2);
+  uint32_t cell_size_without_header = alloc_npow2;
     
   //arena_index = log(cell_size_without_header) / log(2.0f);
   //// ignore the first couple powers of two until we reach BYTE_ALIGNMENT size cells (that's where our cell sizes start)
@@ -416,7 +455,7 @@ void MemoryManager::Deallocate(void* data, size_t size) {
   unsigned int cell_size_with_header = (sizeof(CellHeader) + arena_header->cell_size_bytes);
   // ok we found the arena it's in. turn off the bit in the arena header to mark it as unoccupied
   unsigned char* cell_start = reinterpret_cast<unsigned char*>(data) - sizeof(CellHeader);
-  unsigned int bit_position_for_cell = (cell_start - arena_header->arena_start) / cell_size_with_header;
+  unsigned int bit_position_for_cell = static_cast<unsigned int>((cell_start - arena_header->arena_start) / cell_size_with_header);
   unsigned long long bit = ~(1ULL << bit_position_for_cell);
   arena_header->cell_occupation_bits = arena_header->cell_occupation_bits & bit;
 }
@@ -434,10 +473,10 @@ MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(Thread
   // allocate the arena index dimension
   // first calculate how many arenas we need based on arenas that have power-of-two size cells in them, doubling each time until we hit the max cell size
   // this will include an arena with 1-byte cells which isn't very useful, so we subtract off the first couple
-  unsigned int arenas_needed = log(MAX_CELL_SIZE) / log(2.0f);
+  unsigned int arenas_needed = static_cast<unsigned int>(log(MAX_CELL_SIZE) / log(2.0f));
   // it will screw up byte alignment if we allow arenas that have cell sizes < BYTE_ALIGNMENT
   // so we need to ignore the first couple powers of two below a cell size of BYTE_ALIGNMENT
-  unsigned int ignore_first_n = ((log(BYTE_ALIGNMENT) / log(2.0f)) - 1);
+  unsigned int ignore_first_n = static_cast<unsigned int>(((log(BYTE_ALIGNMENT) / log(2.0f)) - 1));
   arenas_needed -= ignore_first_n;
   // now we know how many arenas we need, allocate the array of pointers to their collections
   // since we use calloc, everything will be zero initialized for us
@@ -455,22 +494,31 @@ MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(Thread
 MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_size_without_header_bytes, size_t alignment_bytes, ArenaCollection* arena_collection) {
   const size_t header_size = sizeof(ArenaHeader);
   // how many cells go in this arena?
-  unsigned int cell_capacity = CalculateCellCapacityForArena(cell_size_without_header_bytes, MAX_ARENA_SIZE, MAX_CELLS_PER_ARENA);
+  unsigned int cell_capacity = CalculateCellCapacityForArena(static_cast<unsigned int>(cell_size_without_header_bytes), MAX_ARENA_SIZE, MAX_CELLS_PER_ARENA);
   // The arena header is part of the contiguous block of memory along with the cells. The header is always part of the first bytes of memory.
   // the alignment_bytes bytes here allow us to make sure we have room for byte alignment padding between the header and the data cells *wherever* the OS decides to give us memory
   // each cell contains: a pointer to the arena header, some guard padding, then the cell data itself
-  unsigned char* raw_arena = reinterpret_cast<unsigned char*>(malloc(header_size + alignment_bytes + ((sizeof(CellHeader) + cell_size_without_header_bytes) * cell_capacity)));
+  size_t arena_size = header_size + alignment_bytes + ((sizeof(CellHeader) + cell_size_without_header_bytes) * cell_capacity);
+  unsigned char* raw_arena = reinterpret_cast<unsigned char*>(malloc(arena_size));
   if (!raw_arena) {
     return nullptr;
   }
-  // zero out the header
+#if _WIN32
+  // visual studio will complain about a buffer overrun with the memset but that's not possible. arena_size can never be less than header_size.
+#pragma warning( push )
+#pragma warning(disable : 6386)
+#endif
+  // zero out only the header
   memset(raw_arena, 0, header_size);
+#if _WIN32
+#pragma warning( pop )
+#endif
   ArenaHeader* arena_header = reinterpret_cast<ArenaHeader*>(raw_arena);
-  arena_header->cell_size_bytes = cell_size_without_header_bytes;
+  arena_header->cell_size_bytes = static_cast<unsigned int>(cell_size_without_header_bytes);
   arena_header->cell_capacity = cell_capacity;
   // this works based on the property that a power of two alignment number like 8 for example (1000 in binary)
   // will be 0111 once we subtract 1, giving us our mask.
-  uint64_t padding_addr_mask = alignment_bytes - 1U;
+  uint64_t padding_addr_mask = static_cast<unsigned int>(alignment_bytes - 1U);
   // figure out how many bytes past the header we can start the arena in order to be byte-aligned
   unsigned char* raw_arena_past_header = raw_arena + header_size;
   // any bits of the address that land within the mask area will signal that raw_arena_past_header is not on an address that is a multiple of alignment_bytes
@@ -479,7 +527,7 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   uint64_t masked_addr_past_header = (padding_addr_mask & reinterpret_cast<uint64_t>(raw_arena_past_header));
   // so for example, if masked_addr_past_header indicates we're 1 byte past a desired alignment, we need to move forward (alignment_bytes - 1) to land on an alignment boundary
   arena_header->arena_collection = arena_collection;
-  arena_header->padding_size_bytes = (alignment_bytes - masked_addr_past_header) % alignment_bytes;
+  arena_header->padding_size_bytes = static_cast<unsigned int>((alignment_bytes - masked_addr_past_header) % alignment_bytes);
   arena_header->arena_start = raw_arena + header_size + arena_header->padding_size_bytes;
   arena_header->arena_end = arena_header->arena_start + ((sizeof(CellHeader) + cell_size_without_header_bytes) * cell_capacity) - 1;
   arena_header->derelict = false;
@@ -612,12 +660,15 @@ void MemoryManager::Test_StandardAllocDealloc() {
   if (!thread_id) {
     thread_id = GET_CURRENT_THREAD_ID();
   }
+  MemoryManager::ClearAllocErrors();
+  MemoryManager::ClearDeallocErrors();
+
   // make an alloc
   MMTestStructTiny* a = new MMTestStructTiny;
 
   ThreadSandboxNode* sandbox = thread_memory_sandboxes;
   sandbox = FindSandboxForThread(thread_id, prev_sandbox);
-  assert("thread-local thread_sandbox does not match?", sandbox == thread_sandbox);
+  assert(sandbox == thread_sandbox); // "thread-local thread_sandbox does not match?"
 
   // validate global state
   ArenaCollection* collection = sandbox->arenas[0];
