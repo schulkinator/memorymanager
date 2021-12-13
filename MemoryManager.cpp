@@ -46,28 +46,25 @@
 
 // Macro to count the leading number of zeros before the most significant bit.
 #if defined _M_X64 || defined _M_IX86 || defined __x86_64__
-  #define COUNT_NUM_LEADING_ZEROES(bits) _lzcnt_u32(bits) /* This is an x86 specific BMI instruction intrinsic */
+  #define COUNT_NUM_LEADING_ZEROES_UINT32(bits) _lzcnt_u32(bits) /* This is an x86 specific BMI instruction intrinsic */
 #else
-  #define COUNT_NUM_LEADING_ZEROES(bits) __builtin_clzl(bits)
+  #define COUNT_NUM_LEADING_ZEROES_UINT32(bits) __builtin_clzl(bits)
 #endif
 
-// Calculate the next highest power of 2 from the given number n (assumes integer types)
-#define NEXT_POW2(n) \
-(n)--; \
-(n) |= (n) >> 1; \
-(n) |= (n) >> 2; \
-(n) |= (n) >> 4; \
-(n) |= (n) >> 8; \
-(n) |= (n) >> 16; \
-(n)++;
+#if defined _M_X64 || defined _M_IX86 || defined __x86_64__
+#define COUNT_NUM_LEADING_ZEROES_UINT64(bits) _lzcnt_u64(bits) /* This is an x86 specific BMI instruction intrinsic */
+#else
+#define COUNT_NUM_LEADING_ZEROES_UINT64(bits) __builtin_clzll(bits)
+// I've also seen this as _BitScanReverse64 in some places
+#endif
 
 // intrinsic based version for 64bit uint
 #define NEXT_POW2_UINT64(n) \
-n == 1 ? 1 : 1<<(64-COUNT_NUM_LEADING_ZEROES(n-1))
+n == 1 ? 1 : 1<<(64-COUNT_NUM_LEADING_ZEROES_UINT64(n-1))
 
 // intrinsic based version for 32bit uint
 #define NEXT_POW2_UINT32(n) \
-n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES(n-1))
+n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES_UINT32(n-1))
 
 // Threading macros
 #if _WIN32
