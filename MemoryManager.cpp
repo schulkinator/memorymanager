@@ -399,7 +399,6 @@ void MemoryManager::Deallocate(void* data, size_t size) {
   unsigned char* data_char = reinterpret_cast<unsigned char*>(data);
   CellHeader* cell_header = reinterpret_cast<CellHeader*>(data_char - sizeof(CellHeader));
   ArenaHeader* arena_header = nullptr;
-  unsigned char* cell_header_start = nullptr;
   if (cell_header->dummy_guard == VALID_CELL_HEADER_MARKER) {
     // we have a valid cell header!    
     arena_header = cell_header->arena_header;
@@ -414,6 +413,7 @@ void MemoryManager::Deallocate(void* data, size_t size) {
   ThreadSandboxNode* owning_sandbox = arena_collection->sandbox;
   if (!owning_sandbox) {
     mm_dealloc_error_status |= 4;
+    return;
   }
   bool thread_safe = owning_sandbox->thread_id == thread_id;
   if (!thread_safe) {
