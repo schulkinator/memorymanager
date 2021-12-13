@@ -72,7 +72,7 @@ void operator delete(void* p);
 void operator delete(void*, size_t size);
 void operator delete(void*, size_t size, const std::nothrow_t&) noexcept;
 void operator delete[](void*, size_t size);
-void operator delete[](void* p, size_t size, const std::nothrow_t) noexcept;
+void operator delete[](void* p, size_t size, const std::nothrow_t&) noexcept;
 void operator delete[](void* p);
 #endif
 
@@ -214,6 +214,7 @@ private:
   static thread_local ThreadSandboxNode* thread_sandbox;
   static thread_local unsigned int mm_dealloc_error_status; /* nonzero means error */
   static thread_local unsigned int mm_alloc_error_status; /* nonzero means error */    
+
 };
 
 #if _MSC_VER >= 1200
