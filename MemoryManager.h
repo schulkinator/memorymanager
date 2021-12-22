@@ -123,6 +123,7 @@ public:
     // all arenas in this collection will have the same size cells
     unsigned int cell_size_bytes;
     unsigned int num_arenas;
+    // pointer to the first arena in the linked list of arenas
     ArenaHeader* first;
     // points to an arena which recently had a cell deallocation (meaning it probably has a free cell)
     ArenaHeader* recent_dealloc_arena;
@@ -149,6 +150,7 @@ public:
     unsigned char* arena_start;
     // arena_end will point to the last byte of the last cell in the arena
     unsigned char* arena_end;
+    // pointer to the next arena in the linked list of arenas
     ArenaHeader* next;
     // is this memory derelict? (see ThreadSandboxNode for definition of the term derelict memory)
     bool derelict;
@@ -165,9 +167,37 @@ public:
     unsigned long long dummy_guard;
   };
 
+  //There is one additional wrinkle: Even though we keep thread memory sandboxes separate, one thread may try to delete memory in another thread sandbox.
+  //In this case we need to put the delete request from the alien thread on a queue and then process it on the local thread at a later time.
+  //Access to this queue MUST be synchronized with a mutex.
+  // We operate with the observations:
+  //a) often the object is freed by the same thread that had allocated it, and
+  //b) when the object is deleted by a different thread, it does not interfere with all other threads, 
+  //   but only with those that need to use the same pending requests list
   struct DeallocRequest {
     void* data;
     size_t size;
+  };
+
+  // The global static system state across all threads
+  struct GlobalState {
+    GlobalState();
+    ThreadSandboxNode* thread_memory_sandboxes;
+    std::mutex sandbox_list_mutex;
+    unsigned int base_arena_index;
+  };
+
+  // State that is global to individual threads
+  struct ThreadState {
+    // thread constructor
+    ThreadState();
+    // thread destructor, cleans up the memory allocated on this thread
+    ~ThreadState();
+    unsigned int thread_id;
+    // the sandbox for this thread
+    ThreadSandboxNode* thread_sandbox;
+    unsigned int mm_dealloc_error_status; /* nonzero means error */
+    unsigned int mm_alloc_error_status; /* nonzero means error */
   };
 
   static void* Allocate(size_t size, void (*error_handler)());
@@ -175,11 +205,22 @@ public:
 
   static void HandleAllocErrorThrow();
   static void HandleAllocErrorNoThrow() noexcept;
-
   // clears alloc errors on this thread (each thread has its own error status)
   static void ClearAllocErrors();
   // clears dealloc errors on this thread (each thread has its own error status)
   static void ClearDeallocErrors();
+
+  // deallocate all thread memory and shut down
+  static void ThreadShutdown();
+
+  // Unit tests
+  static void Test_StandardAllocDealloc();
+  static void Test_CrossThreadAllocDealloc();
+  static void Test_ErrorHandling();
+  static void Test_StochasticAllocDealloc();
+  static void PerfTest_AllocDealloc();  
+
+private:
 
   static ThreadSandboxNode* AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id);
   static inline ThreadSandboxNode* FindSandboxForThread(unsigned int thread_id, ThreadSandboxNode*& last_node);
@@ -189,37 +230,15 @@ public:
   static inline unsigned int CalculateCellSizeAndArenaIndexForAllocation(size_t allocation_size, unsigned int& arena_index);
   static inline unsigned int CalculateCellCapacityForArena(unsigned int cell_size, unsigned int max_arena_size, unsigned int max_cells_per_arena);
 
-  // deallocate all thread memory and shut down
-  static void ThreadShutdown();
-
-  //There is one additional wrinkle: Even though we keep thread memory sandboxes separate, one thread may try to delete memory in another thread sandbox.
-  //In this case we need to put the delete request from the alien thread on a queue and then process it on the local thread at a later time.
-  //Access to this queue MUST be synchronized with a mutex.
-  // We operate with the observations:
-  //a) often the object is freed by the same thread that had allocated it, and
-  //b) when the object is deleted by a different thread, it does not interfere with all other threads, 
-  //   but only with those that need to use the same pending requests list
-
-  // Unit tests
-  static void Test_StandardAllocDealloc();
-  static void Test_CrossThreadAllocDealloc();
-  static void Test_ErrorHandling();
-  static void PerfTest_AllocDealloc();  
-
-private:
   // makes a deallocation request on another thread's deallocation queue. returns zero on success, otherwise error code
   static int MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_sandbox, void* data, size_t size);
   // process all the deallocation requests on this thread. returns zero on success, otherwise error code
   static int ProcessDeallocationRequests(ThreadSandboxNode* owning_sandbox);
-  ////// Global state across all threads ////////
-  static ThreadSandboxNode* thread_memory_sandboxes;
-  static std::mutex sandbox_list_mutex;
-  static unsigned int base_arena_index;
-  ////// Each thread will have its own global state here //////
-  static thread_local unsigned int thread_id;
-  static thread_local ThreadSandboxNode* thread_sandbox;
-  static thread_local unsigned int mm_dealloc_error_status; /* nonzero means error */
-  static thread_local unsigned int mm_alloc_error_status; /* nonzero means error */    
+
+  ////// Global state across all threads ////////  
+  static GlobalState global_state;
+  ////// Each thread will have its own global state here //////   
+  static thread_local ThreadState thread_state;
 
 };
 

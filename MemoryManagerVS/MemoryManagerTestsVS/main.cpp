@@ -10,6 +10,8 @@ int main(void) {
 
 	MemoryManager::Test_ErrorHandling();
 
+	MemoryManager::Test_StochasticAllocDealloc();
+
 	MemoryManager::PerfTest_AllocDealloc();
 
 	return 0;
