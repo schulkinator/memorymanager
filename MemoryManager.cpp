@@ -241,13 +241,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   }
   // now we can process the sandbox
   // first, do we have any cross-thread dealloc requests to handle?
-  // TODO: this atomic access seems to be a performance bottleneck. Need to figure out a way to check it less often?
-  while (thread_sandbox->num_deallocs_queued > 0) {
-    std::lock_guard<std::mutex> guard(thread_sandbox->dealloc_mutex);
-    thread_sandbox->num_deallocs_queued--;
-    DeallocRequest* request = thread_sandbox->dealloc_queue + thread_sandbox->num_deallocs_queued;
-    Deallocate(request->data, request->size);
-  }
+  ProcessDeallocationRequests(thread_sandbox);
   // which cell size do we need for this allocation? (doesn't make sense to allocate anything smaller than BYTE_ALIGNMENT number of bytes)
   unsigned int cell_size_without_header = 0;
   unsigned int arena_index = 0;
@@ -316,6 +310,17 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   // the pointer we return is at the appropriate cell, past the header of the cell
   unsigned char* ptr = arena_header->arena_start + (cell_index * (sizeof(CellHeader) + arena_header->cell_size_bytes)) + sizeof(CellHeader);
   return reinterpret_cast<void*>(ptr);
+}
+
+int MemoryManager::ProcessDeallocationRequests(ThreadSandboxNode* owning_sandbox) {
+  // TODO: this atomic access seems to be a performance bottleneck. Need to figure out a way to check it less often?
+  while (owning_sandbox->num_deallocs_queued > 0) {
+    std::lock_guard<std::mutex> guard(owning_sandbox->dealloc_mutex);
+    owning_sandbox->num_deallocs_queued--;
+    DeallocRequest* request = owning_sandbox->dealloc_queue + owning_sandbox->num_deallocs_queued;
+    Deallocate(request->data, request->size);
+  }
+  return 0;
 }
 
 inline unsigned int MemoryManager::CalculateCellSizeAndArenaIndexForAllocation(size_t allocation_size, unsigned int& arena_index) {
@@ -418,32 +423,11 @@ void MemoryManager::Deallocate(void* data, size_t size) {
   bool thread_safe = owning_sandbox->thread_id == thread_id;
   if (!thread_safe) {
     // we don't own this memory, so we can't deallocate it here. make a dealloc request on the owning sandbox
-    std::lock_guard<std::mutex> guard(owning_sandbox->dealloc_mutex);
-    // if we don't have enough room to make a request, realloc more room (this includes the initial queue alloc)
-    if (owning_sandbox->num_deallocs_queued == owning_sandbox->deallocs_capacity) {
-      // minimum of 10 request slots
-      unsigned int new_capacity = std::max(10u, owning_sandbox->deallocs_capacity * 2);
-      DeallocRequest* new_queue = nullptr;
-      if (owning_sandbox->dealloc_queue) {
-        new_queue = reinterpret_cast<DeallocRequest*>(realloc(owning_sandbox->dealloc_queue, sizeof(DeallocRequest) * (new_capacity)));
-      }
-      else {
-        // very first queue alloc
-        // since we use calloc, everything will be zero initialized for us
-        new_queue = reinterpret_cast<DeallocRequest*>(calloc(new_capacity, sizeof(DeallocRequest)));
-      }
-      if (!new_queue) {
-        mm_dealloc_error_status |= 8;
-        return;
-      }
-      owning_sandbox->dealloc_queue = new_queue;
-      owning_sandbox->deallocs_capacity = new_capacity;
+    int dealloc_status = MakeDeallocRequestOnOtherThread(owning_sandbox, data, size);
+    if (dealloc_status) {
+      mm_dealloc_error_status |= 8;
+      return;
     }
-    // set the request
-    DeallocRequest* request = owning_sandbox->dealloc_queue + owning_sandbox->num_deallocs_queued;
-    request->data = data;
-    request->size = size;
-    owning_sandbox->num_deallocs_queued++;
     return;
   }
   // okay we for sure have ownership over this memory, mark it as deallocated
@@ -455,6 +439,36 @@ void MemoryManager::Deallocate(void* data, size_t size) {
   unsigned int bit_position_for_cell = static_cast<unsigned int>((cell_start - arena_header->arena_start) / cell_size_with_header);
   unsigned long long bit = ~(1ULL << bit_position_for_cell);
   arena_header->cell_occupation_bits = arena_header->cell_occupation_bits & bit;
+}
+
+int MemoryManager::MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_sandbox, void* data, size_t size) {
+  // we don't own this memory, so we can't deallocate it on this thread. make a dealloc request on the owning sandbox
+  std::lock_guard<std::mutex> guard(owning_sandbox->dealloc_mutex);
+  // if we don't have enough room to make a request, realloc more room (this includes the initial queue alloc)
+  if (owning_sandbox->num_deallocs_queued == owning_sandbox->deallocs_capacity) {
+    // minimum of 10 request slots
+    unsigned int new_capacity = std::max(10u, owning_sandbox->deallocs_capacity * 2);
+    DeallocRequest* new_queue = nullptr;
+    if (owning_sandbox->dealloc_queue) {
+      new_queue = reinterpret_cast<DeallocRequest*>(realloc(owning_sandbox->dealloc_queue, sizeof(DeallocRequest) * (new_capacity)));
+    }
+    else {
+      // very first queue alloc
+      // since we use calloc, everything will be zero initialized for us
+      new_queue = reinterpret_cast<DeallocRequest*>(calloc(new_capacity, sizeof(DeallocRequest)));
+    }
+    if (!new_queue) {
+      return 1;
+    }
+    owning_sandbox->dealloc_queue = new_queue;
+    owning_sandbox->deallocs_capacity = new_capacity;
+  }
+  // set the request
+  DeallocRequest* request = owning_sandbox->dealloc_queue + owning_sandbox->num_deallocs_queued;
+  request->data = data;
+  request->size = size;
+  owning_sandbox->num_deallocs_queued++;
+  return 0;
 }
 
 MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id) {
@@ -551,6 +565,8 @@ void MemoryManager::ThreadShutdown() {
   if (!thread_sandbox) {
     return;
   }
+  // process queued deallocs from other threads if there are any waiting
+  ProcessDeallocationRequests(thread_sandbox);
   // kill all the arenas for this thread
   for (uint32_t i = 0; i < thread_sandbox->num_arena_sizes; ++i) {
     ArenaCollection* arena_collection = thread_sandbox->arenas[i];

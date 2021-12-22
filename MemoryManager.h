@@ -205,6 +205,10 @@ public:
   static void PerfTest_AllocDealloc();  
 
 private:
+  // makes a deallocation request on another thread's deallocation queue. returns zero on success, otherwise error code
+  static int MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_sandbox, void* data, size_t size);
+  // process all the deallocation requests on this thread. returns zero on success, otherwise error code
+  static int ProcessDeallocationRequests(ThreadSandboxNode* owning_sandbox);
   ////// Global state across all threads ////////
   static ThreadSandboxNode* thread_memory_sandboxes;
   static std::mutex sandbox_list_mutex;
