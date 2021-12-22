@@ -39,9 +39,9 @@
 // TODO: these may not be supported by all compilers 
 // Looks like there is a swift-specific function on apple platforms: https://developer.apple.com/documentation/swift/int/2886165-trailingzerobitcount
 #if defined _M_X64 || defined _M_IX86 || defined __x86_64__
-  #define COUNT_NUM_TRAILING_ZEROES(bits) _tzcnt_u32(bits) /* This is an x86 specific BMI instruction intrinsic */
+  #define COUNT_NUM_TRAILING_ZEROES_UINT32(bits) _tzcnt_u32(bits) /* This is an x86 specific BMI instruction intrinsic */
 #else
-  #define COUNT_NUM_TRAILING_ZEROES(bits) __builtin_ctz(bits)
+  #define COUNT_NUM_TRAILING_ZEROES_UINT32(bits) __builtin_ctz(bits)
 #endif
 
 // Macro to count the leading number of zeros before the most significant bit.
@@ -150,10 +150,12 @@ void MemoryManager::HandleAllocErrorNoThrow() noexcept {
 }
 
 void MemoryManager::ClearAllocErrors() {
+  // clears alloc errors on this thread (each thread has its own error status)
   mm_alloc_error_status = 0;
 }
 
 void MemoryManager::ClearDeallocErrors() {
+  // clears dealloc errors on this thread (each thread has its own error status)
   mm_dealloc_error_status = 0;
 }
 
@@ -165,7 +167,7 @@ void MemoryManager::ClearDeallocErrors() {
 // Same with arenas, they are not allocated until they are needed (lazy allocation).
 MemoryManager::ThreadSandboxNode* MemoryManager::thread_memory_sandboxes = nullptr;
 std::mutex MemoryManager::sandbox_list_mutex;
-unsigned int MemoryManager::base_arena_index = COUNT_NUM_TRAILING_ZEROES(BYTE_ALIGNMENT);
+unsigned int MemoryManager::base_arena_index = COUNT_NUM_TRAILING_ZEROES_UINT32(BYTE_ALIGNMENT);
 ////// Each thread will have its own global state here //////
 thread_local unsigned int MemoryManager::thread_id = 0;
 thread_local MemoryManager::ThreadSandboxNode* MemoryManager::thread_sandbox = nullptr;  
@@ -338,7 +340,7 @@ inline unsigned int MemoryManager::CalculateCellSizeAndArenaIndexForAllocation(s
     
   // if we're guaranteed that cell_size_without_header is a power of two, 
   // then we can use a shortcut to calculate the arena index by counting the number of trailing zeroes in the cell size
-  arena_index = COUNT_NUM_TRAILING_ZEROES(cell_size_without_header);
+  arena_index = COUNT_NUM_TRAILING_ZEROES_UINT32(cell_size_without_header);
   arena_index = arena_index - base_arena_index;
   return cell_size_without_header;
 }
@@ -450,6 +452,7 @@ int MemoryManager::MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_san
     unsigned int new_capacity = std::max(10u, owning_sandbox->deallocs_capacity * 2);
     DeallocRequest* new_queue = nullptr;
     if (owning_sandbox->dealloc_queue) {
+      // this can be a slight source of fragmentation, since it can free the old memory and move it somewhere else. doesn't seem common enough to be of concern though
       new_queue = reinterpret_cast<DeallocRequest*>(realloc(owning_sandbox->dealloc_queue, sizeof(DeallocRequest) * (new_capacity)));
     }
     else {

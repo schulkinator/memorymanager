@@ -176,7 +176,9 @@ public:
   static void HandleAllocErrorThrow();
   static void HandleAllocErrorNoThrow() noexcept;
 
+  // clears alloc errors on this thread (each thread has its own error status)
   static void ClearAllocErrors();
+  // clears dealloc errors on this thread (each thread has its own error status)
   static void ClearDeallocErrors();
 
   static ThreadSandboxNode* AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id);
