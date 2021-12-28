@@ -17,6 +17,8 @@
 #include <windows.h>
 #include <Processthreadsapi.h>
 #include <intrin.h>
+#elif
+#include <unistd.h> // for sysconf
 #endif
 
 #if _MSC_VER >= 1200
@@ -69,7 +71,7 @@ n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES_UINT32(n-1))
 #define RAND_IN_RANGE(min, max) rand() % ((max) - (min)) + 1 + min
 
 // Threading macros
-#if _WIN32
+#ifdef _WIN32
 #define GET_CURRENT_THREAD_ID() ::GetCurrentThreadId()
 #elif __APPLE__  
   #if TARGET_IPHONE_SIMULATOR
@@ -88,6 +90,25 @@ n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES_UINT32(n-1))
 #define GET_CURRENT_THREAD_ID() static_cast<unsigned int>(gettid())
 #elif __linux__
 #define GET_CURRENT_THREAD_ID() static_cast<unsigned int>(gettid())
+#endif
+
+// kernel-level allocation/free functions. These allow us to jump over a level of function call overhead with malloc() for performance
+#ifdef _WIN32
+HANDLE mm_proc_handle;
+SYSTEM_INFO mm_sys_info;
+#define KMALLOC(size) static_cast<void*>(HeapAlloc(mm_proc_handle, HEAP_ZERO_MEMORY, (size)))
+#define KREALLOC(ptr, size) static_cast<void*>(HeapReAlloc(mm_proc_handle, HEAP_REALLOC_IN_PLACE_ONLY, (size)))
+#define KFREE(ptr) HeapFree(mm_proc_handle, HEAP_NO_SERIALIZE, (ptr))
+#define GET_SYS_PAGESIZE() (mm_sys_info.dwPageSize)
+#elif __APPLE__
+#elif __ANDROID__
+#elif __linux__
+
+#else
+#define KMALLOC(size) malloc(size)
+#define KREALLOC(ptr, size) realloc(ptr, size)
+#define KFREE(ptr) free(ptr)
+#define GET_SYS_PAGESIZE() sysconf(_SC_PAGE_SIZE)
 #endif
 
 
@@ -161,15 +182,19 @@ void MemoryManager::ClearDeallocErrors() {
   MemoryManager::thread_state.mm_dealloc_error_status = 0;
 }
 
-// Linked list of sandboxes, one per thread.
-// For threading each thread gets its own collection of memory arenas to manage in parallel. This reduces mutex locking overhead.
-// at the beginning of each arena in the collection is a header
-// which tells us the size of the arena (and subsequently its cell sizes)
-// Thread memory sandboxes do not get allocated until that particular thread makes an allocation, so there is theoretically an unlimited amount of threads.
-// Same with arenas, they are not allocated until they are needed (lazy allocation).
+// global state constructor
 MemoryManager::GlobalState::GlobalState() :
   base_arena_index(COUNT_NUM_TRAILING_ZEROES_UINT32(BYTE_ALIGNMENT)),
-  thread_memory_sandboxes(nullptr) {
+  thread_memory_sandboxes(nullptr),
+  mm_global_error_status(0) {
+#if _WIN32
+  GetSystemInfo(&mm_sys_info);
+  mm_proc_handle = GetProcessHeap();
+  if (mm_proc_handle == nullptr) {
+    mm_global_error_status = 1;
+    MEM_MGR_LOG("Memory manager error: could not get process heap handle");
+  }
+#endif
 }
 MemoryManager::GlobalState MemoryManager::global_state;
 
@@ -565,7 +590,7 @@ void MemoryManager::ThreadShutdown() {
   // TODO: currently, we just have each thread free its own arena memory. 
   //     but if we have a lot of threads coming and going, this actually causes fragmentation of its own 
   //     (because it blasted a big hole in the contiguous heap memory where this thread had memory allocated)
-  //     So to fix this, we need an exiting thread to transfer ownership to another active thread, 
+  //     So to fix this, we need an exiting thread to transfer ownership of its memory to another active thread, 
   //     and then only the last thread exiting does the actual free()
   if (!MemoryManager::thread_state.thread_sandbox) {
     // we're going to walk the sandbox linked list, so lock the mutex  
@@ -792,6 +817,7 @@ void MemoryManager::Test_StochasticAllocDealloc() {
     uint32_t cell_size_without_header = CalculateCellSizeAndArenaIndexForAllocation(alloc_size, arena_index);
     ArenaCollection* arena_collection = MemoryManager::thread_state.thread_sandbox->arenas[arena_index];
     unsigned char* data_char = reinterpret_cast<unsigned char*>(alloc_list[i]);
+    // get the arena header from the cell header
     CellHeader* cell_header = reinterpret_cast<CellHeader*>(data_char - sizeof(CellHeader));
     assert(cell_header->dummy_guard == VALID_CELL_HEADER_MARKER);
     ArenaHeader* arena = cell_header->arena_header;
@@ -801,14 +827,49 @@ void MemoryManager::Test_StochasticAllocDealloc() {
     assert(arena_collection->recent_alloc_arena == arena);
     // its the cell size we expect
     assert(cell_size_without_header == arena->cell_size_bytes);
+    // randomly deallocate stuff to simulate fragmentation over time
+    if ((RAND_IN_RANGE(0, 100)) < 30) {
+      // pick a random allocation to deallocate
+      int j = RAND_IN_RANGE(0, i);
+      if (alloc_list[j] == nullptr) {
+        continue;
+      }
+      // before we deallocate, grab the arena for that allocation so we can watch it change before and after the deallocation
+      uint32_t arena_index = 0;
+      uint32_t cell_size_without_header = CalculateCellSizeAndArenaIndexForAllocation(size_list[j], arena_index);
+      ArenaCollection* arena_collection = MemoryManager::thread_state.thread_sandbox->arenas[arena_index];
+      unsigned char* data_char = reinterpret_cast<unsigned char*>(alloc_list[j]);
+      // get the arena header from the cell header
+      CellHeader* cell_header = reinterpret_cast<CellHeader*>(data_char - sizeof(CellHeader));
+      assert(cell_header->dummy_guard == VALID_CELL_HEADER_MARKER);
+      ArenaHeader* arena = cell_header->arena_header;
+      auto num_cells_occupied_before = arena->num_cells_occupied;
+      auto cell_occupation_bits_before = arena->cell_occupation_bits;
+      // arena collection is valid
+      assert(arena_collection != nullptr);
+      // do the deallocation
+      delete alloc_list[j];
+      // the arena collection has the expected arena as its recent dealloc
+      assert(arena_collection->recent_dealloc_arena == arena);
+      // the number of occupied cells went down by one
+      assert(arena->num_cells_occupied == (num_cells_occupied_before - 1));
+      // cell occupation bits changed
+      assert(arena->cell_occupation_bits != cell_occupation_bits_before);
+      // null out that element so we dont try to dealloc it again
+      alloc_list[j] = nullptr;
+    }
   }  
-  // deallocate
+  // deallocate everything
   for (int i = 0; i < num_allocs; ++i) {
+    if (alloc_list[i] == nullptr) {
+      continue;
+    }
     // before we deallocate, grab the arena for that allocation so we can watch it change before and after the deallocation
     uint32_t arena_index = 0;
     uint32_t cell_size_without_header = CalculateCellSizeAndArenaIndexForAllocation(size_list[i], arena_index);
     ArenaCollection* arena_collection = MemoryManager::thread_state.thread_sandbox->arenas[arena_index];
     unsigned char* data_char = reinterpret_cast<unsigned char*>(alloc_list[i]);
+    // get the arena header from the cell header
     CellHeader* cell_header = reinterpret_cast<CellHeader*>(data_char - sizeof(CellHeader));
     assert(cell_header->dummy_guard == VALID_CELL_HEADER_MARKER);
     ArenaHeader* arena = cell_header->arena_header;

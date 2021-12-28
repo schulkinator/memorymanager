@@ -182,9 +182,16 @@ public:
   // The global static system state across all threads
   struct GlobalState {
     GlobalState();
+    // thread_memory_sandboxes is a linked list of sandboxes, one element per thread.
+    // For threading each thread gets its own collection of memory arenas to manage in parallel. This reduces mutex locking overhead.
+    // at the beginning of each arena in the collection is a header
+    // which tells us the size of the arena (and subsequently its cell sizes)
+    // Thread memory sandboxes do not get allocated until that particular thread makes an allocation, so there is theoretically an unlimited amount of threads.
+    // Same with arenas, they are not allocated until they are needed (lazy allocation).
     ThreadSandboxNode* thread_memory_sandboxes;
     std::mutex sandbox_list_mutex;
     unsigned int base_arena_index;
+    unsigned int mm_global_error_status; /* nonzero means error */
   };
 
   // State that is global to individual threads
