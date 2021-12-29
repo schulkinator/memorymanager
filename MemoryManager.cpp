@@ -15,6 +15,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <heapapi.h>
 #include <Processthreadsapi.h>
 #include <intrin.h>
 #elif
@@ -94,20 +95,30 @@ n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES_UINT32(n-1))
 
 // kernel-level allocation/free functions. These allow us to jump over a level of function call overhead with malloc() for performance
 #ifdef _WIN32
-HANDLE mm_proc_handle;
+HANDLE mm_proc_heap;
+thread_local HANDLE mm_thread_heap; // the thread-local heap handle (unique to each thread)
 SYSTEM_INFO mm_sys_info;
-#define KMALLOC(size) static_cast<void*>(HeapAlloc(mm_proc_handle, HEAP_ZERO_MEMORY, (size)))
-#define KREALLOC(ptr, size) static_cast<void*>(HeapReAlloc(mm_proc_handle, HEAP_REALLOC_IN_PLACE_ONLY, (size)))
-#define KFREE(ptr) HeapFree(mm_proc_handle, HEAP_NO_SERIALIZE, (ptr))
+#define KMALLOC(size) static_cast<void*>(HeapAlloc(mm_thread_heap, HEAP_NO_SERIALIZE, (size))) /* NOTE: we allow HEAP_NO_SERIALIZE because each thread has its own heap, so no synchronization is necessary */
+#define KREALLOC(ptr, size) static_cast<void*>(HeapReAlloc(mm_thread_heap, HEAP_NO_SERIALIZE | HEAP_REALLOC_IN_PLACE_ONLY, static_cast<LPVOID>(ptr), (size)))
+#define KCALLOC(nitems, size) static_cast<void*>(HeapAlloc(mm_thread_heap, HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY, (nitems)*(size)))
+#define KFREE(ptr) HeapFree(mm_thread_heap, HEAP_NO_SERIALIZE, (ptr)) /* NOTE: we allow HEAP_NO_SERIALIZE because each thread has its own heap, so no synchronization is necessary */
+#define GLOBAL_KMALLOC(size) static_cast<void*>(HeapAlloc(mm_proc_heap, 0, (size))) /* since this is the process heap, we must force serialization */
+#define GLOBAL_KREALLOC(ptr, size) static_cast<void*>(HeapReAlloc(mm_proc_heap, HEAP_REALLOC_IN_PLACE_ONLY, static_cast<LPVOID>(ptr), (size))) /* since this is the process heap, we must force serialization */
+#define GLOBAL_KCALLOC(nitems, size) static_cast<void*>(HeapAlloc(mm_proc_heap, HEAP_ZERO_MEMORY, (nitems)*(size))) /* since this is the process heap, we must force serialization */
+#define GLOBAL_KFREE(ptr) HeapFree(mm_proc_heap, 0, (ptr)) /* since this is the process heap, we must force serialization */
 #define GET_SYS_PAGESIZE() (mm_sys_info.dwPageSize)
 #elif __APPLE__
 #elif __ANDROID__
 #elif __linux__
-
 #else
 #define KMALLOC(size) malloc(size)
 #define KREALLOC(ptr, size) realloc(ptr, size)
 #define KFREE(ptr) free(ptr)
+#define KCALLOC(nitems, size) calloc(nitems, size)
+#define GLOBAL_KMALLOC(size) malloc(size)
+#define GLOBAL_KREALLOC(ptr, size) realloc(ptr, size)
+#define GLOBAL_KFREE(ptr) free(ptr)
+#define GLOBAL_KCALLOC(nitems, size) calloc(nitems, size)
 #define GET_SYS_PAGESIZE() sysconf(_SC_PAGE_SIZE)
 #endif
 
@@ -187,10 +198,10 @@ MemoryManager::GlobalState::GlobalState() :
   base_arena_index(COUNT_NUM_TRAILING_ZEROES_UINT32(BYTE_ALIGNMENT)),
   thread_memory_sandboxes(nullptr),
   mm_global_error_status(0) {
-#if _WIN32
+#ifdef _WIN32
   GetSystemInfo(&mm_sys_info);
-  mm_proc_handle = GetProcessHeap();
-  if (mm_proc_handle == nullptr) {
+  mm_proc_heap = GetProcessHeap();
+  if (mm_proc_heap == nullptr) {
     mm_global_error_status = 1;
     MEM_MGR_LOG("Memory manager error: could not get process heap handle");
   }
@@ -205,10 +216,17 @@ MemoryManager::ThreadState::ThreadState() :
   mm_alloc_error_status(0), 
   thread_sandbox(nullptr),
   thread_id(0) {
+#ifdef _WIN32
+  // create a heap for this thread and don't use thread synchronization to protect allocations (we have our own thread protection mechanism)
+  mm_thread_heap = HeapCreate(HEAP_NO_SERIALIZE, 0, 0);
+#endif
 }
 // thread destructor
 MemoryManager::ThreadState::~ThreadState() {
   MemoryManager::ThreadShutdown();
+#ifdef _WIN32
+  HeapDestroy(mm_thread_heap);
+#endif
 }
 thread_local MemoryManager::ThreadState MemoryManager::thread_state;
 
@@ -219,7 +237,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   else if (size > MAX_CELL_SIZE) {
     // beyond MAX_ALLOCATION_SIZE we don't care, we're more concerned about small allocations fragmenting memory    
     // stamp down a header to mark it as outside memory
-    unsigned char* p = reinterpret_cast<unsigned char*>(malloc(size + BYTE_ALIGNMENT));
+    unsigned char* p = reinterpret_cast<unsigned char*>(KMALLOC(size + BYTE_ALIGNMENT));
     if (!p) {
       // allocation failed
       error_handler();
@@ -282,7 +300,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   if (!arena_collection) {
     // no arena collection was allocated for this allocation size yet, allocate it now    
     // since we use calloc, everything will be zero initialized for us
-    arena_collection = reinterpret_cast<ArenaCollection*>(calloc(1, sizeof(ArenaCollection)));
+    arena_collection = reinterpret_cast<ArenaCollection*>(KCALLOC(1, sizeof(ArenaCollection)));
     if (!arena_collection) {
       // arena collection allocation failed
       error_handler();
@@ -348,6 +366,7 @@ int MemoryManager::ProcessDeallocationRequests(ThreadSandboxNode* owning_sandbox
     std::lock_guard<std::mutex> guard(owning_sandbox->dealloc_mutex);
     owning_sandbox->num_deallocs_queued--;
     DeallocRequest* request = owning_sandbox->dealloc_queue + owning_sandbox->num_deallocs_queued;
+    // TODO: should we release the lock here first before deallocating?
     Deallocate(request->data, request->size);
   }
   return 0;
@@ -404,7 +423,7 @@ void MemoryManager::Deallocate(void* data, size_t size) {
   unsigned int* marker_ptr = reinterpret_cast<unsigned int*>(behind_ptr);
   if (size > MAX_CELL_SIZE || (*marker_ptr == OUTSIDE_SYSTEM_MARKER)) {
     // beyond MAX_ALLOCATION_SIZE we don't care, we're more concerned about small allocations fragmenting memory     
-    free(behind_ptr);
+    KFREE(behind_ptr);
     return;
   }
   // next we need to identify which sandbox this memory belongs to and if this is a cross-thread deallocation
@@ -481,12 +500,14 @@ int MemoryManager::MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_san
     DeallocRequest* new_queue = nullptr;
     if (owning_sandbox->dealloc_queue) {
       // this can be a slight source of fragmentation, since it can free the old memory and move it somewhere else. doesn't seem common enough to be of concern though
-      new_queue = reinterpret_cast<DeallocRequest*>(realloc(owning_sandbox->dealloc_queue, sizeof(DeallocRequest) * (new_capacity)));
+      // We have to use the global heap here because otherwise we're allocating memory from an alien thread's heap and then when we shut down the deallocating thread tries to free memory that isn't in its own heap
+      new_queue = reinterpret_cast<DeallocRequest*>(GLOBAL_KREALLOC(owning_sandbox->dealloc_queue, sizeof(DeallocRequest) * (new_capacity)));
     }
     else {
       // very first queue alloc
       // since we use calloc, everything will be zero initialized for us
-      new_queue = reinterpret_cast<DeallocRequest*>(calloc(new_capacity, sizeof(DeallocRequest)));
+      // We have to use the global heap here because otherwise we're allocating memory from an alien thread's heap and then when we shut down the deallocating thread tries to free memory that isn't in its own heap
+      new_queue = reinterpret_cast<DeallocRequest*>(GLOBAL_KCALLOC(new_capacity, sizeof(DeallocRequest)));
     }
     if (!new_queue) {
       return 1;
@@ -504,7 +525,7 @@ int MemoryManager::MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_san
 
 MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id) {
   // since we use calloc, everything will be zero initialized for us
-  ThreadSandboxNode* thread_sandbox = reinterpret_cast<ThreadSandboxNode*>(calloc(1, sizeof(ThreadSandboxNode)));
+  ThreadSandboxNode* thread_sandbox = reinterpret_cast<ThreadSandboxNode*>(KCALLOC(1, sizeof(ThreadSandboxNode)));
   if (!thread_sandbox) {
     // allocation failed
     return nullptr;
@@ -522,7 +543,7 @@ MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(Thread
   arenas_needed -= ignore_first_n;
   // now we know how many arenas we need, allocate the array of pointers to their collections
   // since we use calloc, everything will be zero initialized for us
-  thread_sandbox->arenas = reinterpret_cast<ArenaCollection**>(calloc(arenas_needed, sizeof(ArenaCollection*)));
+  thread_sandbox->arenas = reinterpret_cast<ArenaCollection**>(KCALLOC(arenas_needed, sizeof(ArenaCollection*)));
   thread_sandbox->num_arena_sizes = arenas_needed;
   thread_sandbox->thread_id = thread_id;
   thread_sandbox->derelict = false;
@@ -541,7 +562,7 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   // the alignment_bytes bytes here allow us to make sure we have room for byte alignment padding between the header and the data cells *wherever* the OS decides to give us memory
   // each cell contains: a pointer to the arena header, some guard padding, then the cell data itself
   size_t arena_size = header_size + alignment_bytes + ((sizeof(CellHeader) + cell_size_without_header_bytes) * cell_capacity);
-  unsigned char* raw_arena = reinterpret_cast<unsigned char*>(malloc(arena_size));
+  unsigned char* raw_arena = reinterpret_cast<unsigned char*>(KMALLOC(arena_size));
   if (!raw_arena) {
     return nullptr;
   }
@@ -617,7 +638,7 @@ void MemoryManager::ThreadShutdown() {
       if (arena_header->num_cells_occupied == 0) {
         // destroy that arena
         ArenaHeader* next_arena_header = arena_header->next;
-        free(arena_header);
+        KFREE(arena_header);
         arena_header = next_arena_header;        
       } else {
         // DERELICT!
@@ -645,7 +666,7 @@ void MemoryManager::ThreadShutdown() {
       arena_header_curr_derelict->next = nullptr;
     }
     if (!arena_collection->derelict) {
-      free(arena_collection);
+      KFREE(arena_collection);
       MemoryManager::thread_state.thread_sandbox->arenas[i] = nullptr;
     }    
   }
@@ -657,7 +678,8 @@ void MemoryManager::ThreadShutdown() {
     // deallocate the dealloc_queue for this thread
     // we need to mess with the queue for this sandbox, so lock the dealloc queue mutex
     std::lock_guard<std::mutex> guard(MemoryManager::thread_state.thread_sandbox->dealloc_mutex);
-    free(MemoryManager::thread_state.thread_sandbox->dealloc_queue);
+    // the dealloc queue is allocated on the global process heap, so must use the corresponding free for that
+    GLOBAL_KFREE(MemoryManager::thread_state.thread_sandbox->dealloc_queue);
     MemoryManager::thread_state.thread_sandbox->dealloc_queue = nullptr;
     MemoryManager::thread_state.thread_sandbox->num_deallocs_queued = 0;
     MemoryManager::thread_state.thread_sandbox->deallocs_capacity = 0;
@@ -683,13 +705,13 @@ void MemoryManager::ThreadShutdown() {
       MemoryManager::global_state.thread_memory_sandboxes = curr_node->next;
     }
   }
-  free(MemoryManager::thread_state.thread_sandbox);
+  KFREE(MemoryManager::thread_state.thread_sandbox);
   MemoryManager::thread_state.thread_sandbox = nullptr;
   // TODO: we need to change this so that the last thread to exit destroys the main linked list of sandboxes
   // this should be safe as long as each thread already has its own thread-local sandbox cached
   //std::lock_guard<std::mutex> guard(sandbox_list_mutex);
   //if (thread_memory_sandboxes != nullptr) {    
-  //  free(thread_memory_sandboxes);
+  //  KFREE(thread_memory_sandboxes);
   //  thread_memory_sandboxes = nullptr;
   //}
 }
@@ -796,8 +818,8 @@ void MemoryManager::Test_StochasticAllocDealloc() {
   MemoryManager::ClearDeallocErrors();
   const int num_allocs = 10000;
   // have to use calloc so that we avoid using the memory manager for this test code
-  unsigned char** alloc_list = static_cast<unsigned char**>(calloc(num_allocs, sizeof(unsigned char*)));
-  unsigned int* size_list = static_cast<unsigned int*>(calloc(num_allocs, sizeof(unsigned int)));
+  unsigned char** alloc_list = static_cast<unsigned char**>(KCALLOC(num_allocs, sizeof(unsigned char*)));
+  unsigned int* size_list = static_cast<unsigned int*>(KCALLOC(num_allocs, sizeof(unsigned int)));
   assert(alloc_list != nullptr);
   if (alloc_list == nullptr) {
     return;
@@ -886,8 +908,8 @@ void MemoryManager::Test_StochasticAllocDealloc() {
     // cell occupation bits changed
     assert(arena->cell_occupation_bits != cell_occupation_bits_before);
   }
-  free(alloc_list);
-  free(size_list);
+  KFREE(alloc_list);
+  KFREE(size_list);
 }
 
 void MemoryManager::Test_CrossThreadAllocDealloc() {
