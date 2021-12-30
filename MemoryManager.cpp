@@ -110,6 +110,18 @@ SYSTEM_INFO mm_sys_info;
 #elif __APPLE__
 #elif __ANDROID__
 #elif __linux__
+/* mmap() is typically used for larger allocations that will occupy a whole page of memory (rounds the actual allocated size up to the nearest pagesize multiple). 
+  internally mmap is expensive at the OS level, it has to flush TLBs, and respond to page faults (which is slow).
+  brk()/sbrk() is typically used for smaller allocations and only marks the end of the heap, so it is limited. however it is much faster than mmap. */
+#define KMALLOC(size) mmap(GET_CURRENT_THREAD_ID(), (size), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0)
+#define KREALLOC(ptr, size) mremap(ptr, size)
+#define KFREE(ptr) munmap((ptr), nbytes)
+#define KCALLOC(nitems, size) mmap(GET_CURRENT_THREAD_ID(), (nitems*size), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)
+#define GLOBAL_KMALLOC(size) brk(size)
+#define GLOBAL_KREALLOC(ptr, size) realloc(ptr, size)
+#define GLOBAL_KFREE(ptr) free(ptr)
+#define GLOBAL_KCALLOC(nitems, size) calloc(nitems, size)
+#define GET_SYS_PAGESIZE() sysconf(_SC_PAGE_SIZE)
 #else
 #define KMALLOC(size) malloc(size)
 #define KREALLOC(ptr, size) realloc(ptr, size)
@@ -833,6 +845,8 @@ void MemoryManager::Test_StochasticAllocDealloc() {
     uint32_t alloc_size = RAND_IN_RANGE(1, MAX_CELL_SIZE);
     size_list[i] = alloc_size;
     alloc_list[i] = new unsigned char[alloc_size];
+    // actually write to the memory, on most systems the allocated memory wont be backed/committed to physical pages until it is accessed
+    memset(alloc_list[i], 'a', alloc_size);
     // basic assertions
     assert(alloc_list[i] != nullptr);
     uint32_t arena_index = 0;
