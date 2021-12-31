@@ -99,11 +99,11 @@ HANDLE mm_proc_heap;
 thread_local HANDLE mm_thread_heap; // the thread-local heap handle (unique to each thread)
 SYSTEM_INFO mm_sys_info;
 #define KMALLOC(size) static_cast<void*>(HeapAlloc(mm_thread_heap, HEAP_NO_SERIALIZE, (size))) /* NOTE: we allow HEAP_NO_SERIALIZE because each thread has its own heap, so no synchronization is necessary */
-#define KREALLOC(ptr, size) static_cast<void*>(HeapReAlloc(mm_thread_heap, HEAP_NO_SERIALIZE | HEAP_REALLOC_IN_PLACE_ONLY, static_cast<LPVOID>(ptr), (size)))
+#define KREALLOC(ptr, size) static_cast<void*>(HeapReAlloc(mm_thread_heap, HEAP_NO_SERIALIZE, static_cast<LPVOID>(ptr), (size)))
 #define KCALLOC(nitems, size) static_cast<void*>(HeapAlloc(mm_thread_heap, HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY, (nitems)*(size)))
 #define KFREE(ptr) HeapFree(mm_thread_heap, HEAP_NO_SERIALIZE, (ptr)) /* NOTE: we allow HEAP_NO_SERIALIZE because each thread has its own heap, so no synchronization is necessary */
 #define GLOBAL_KMALLOC(size) static_cast<void*>(HeapAlloc(mm_proc_heap, 0, (size))) /* since this is the process heap, we must force serialization */
-#define GLOBAL_KREALLOC(ptr, size) static_cast<void*>(HeapReAlloc(mm_proc_heap, HEAP_REALLOC_IN_PLACE_ONLY, static_cast<LPVOID>(ptr), (size))) /* since this is the process heap, we must force serialization */
+#define GLOBAL_KREALLOC(ptr, size) static_cast<void*>(HeapReAlloc(mm_proc_heap, 0, static_cast<LPVOID>(ptr), (size))) /* since this is the process heap, we must force serialization */
 #define GLOBAL_KCALLOC(nitems, size) static_cast<void*>(HeapAlloc(mm_proc_heap, HEAP_ZERO_MEMORY, (nitems)*(size))) /* since this is the process heap, we must force serialization */
 #define GLOBAL_KFREE(ptr) HeapFree(mm_proc_heap, 0, (ptr)) /* since this is the process heap, we must force serialization */
 #define GET_SYS_PAGESIZE() (mm_sys_info.dwPageSize)
@@ -113,6 +113,11 @@ SYSTEM_INFO mm_sys_info;
 /* mmap() is typically used for larger allocations that will occupy a whole page of memory (rounds the actual allocated size up to the nearest pagesize multiple). 
   internally mmap is expensive at the OS level, it has to flush TLBs, and respond to page faults (which is slow).
   brk()/sbrk() is typically used for smaller allocations and only marks the end of the heap, so it is limited. however it is much faster than mmap. */
+struct _unix_thread_heap_ {
+  uint32_t thread_id;
+  void* heap_start;
+  void* heap_end;
+};
 #define KMALLOC(size) mmap(GET_CURRENT_THREAD_ID(), (size), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0)
 #define KREALLOC(ptr, size) mremap(ptr, size)
 #define KFREE(ptr) munmap((ptr), nbytes)
