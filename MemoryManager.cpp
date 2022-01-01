@@ -18,8 +18,11 @@
 #include <heapapi.h>
 #include <Processthreadsapi.h>
 #include <intrin.h>
-#elif
+#else
+// unix/linux variants, including OSX
 #include <unistd.h> // for sysconf
+#include <sys/mman.h> // for mmap
+#include <immintrin.h> // for tzcnt/lzcnt intrinsic instructions
 #endif
 
 #if _MSC_VER >= 1200
@@ -118,6 +121,12 @@ struct _unix_thread_heap_ {
   void* heap_start;
   void* heap_end;
 };
+// to allow each thread to have its own independent heap, we need to make sure each thread id maps to a unique region of virtual memory address space.
+// so we need to decide how much heap space each thread is allowed. We'll make the decision that 32k threads are allowed, dividing up the virtual memory address space into 32k equal parts.
+// We also assume that we'll be using a 64bit process and so most 64bit systems will allow up to 43bits of virtual address space (max address 0x7fff ffff ffff)
+// additionally, the program space itself will occupy an unknown amount of instruction, data, and heap space at the bottom of the virtual address space, 
+// and there will be stack space occupied up at the top of the virtual memory space (one stack per thread!)
+#define MAX_SUPPORTED_THREADS 32768
 #define KMALLOC(size) mmap(GET_CURRENT_THREAD_ID(), (size), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0)
 #define KREALLOC(ptr, size) mremap(ptr, size)
 #define KFREE(ptr) munmap((ptr), nbytes)
@@ -889,7 +898,7 @@ void MemoryManager::Test_StochasticAllocDealloc() {
       // arena collection is valid
       assert(arena_collection != nullptr);
       // do the deallocation
-      delete alloc_list[j];
+      delete[] alloc_list[j];
       // the arena collection has the expected arena as its recent dealloc
       assert(arena_collection->recent_dealloc_arena == arena);
       // the number of occupied cells went down by one
@@ -919,13 +928,15 @@ void MemoryManager::Test_StochasticAllocDealloc() {
     // arena collection is valid
     assert(arena_collection != nullptr);
     // do the deallocation
-    delete alloc_list[i];
+    delete[] alloc_list[i];
     // the arena collection has the expected arena as its recent dealloc
     assert(arena_collection->recent_dealloc_arena == arena);
     // the number of occupied cells went down by one
     assert(arena->num_cells_occupied == (num_cells_occupied_before - 1));
     // cell occupation bits changed
     assert(arena->cell_occupation_bits != cell_occupation_bits_before);
+    // null out that element so we dont try to dealloc it again
+    alloc_list[i] = nullptr;
   }
   KFREE(alloc_list);
   KFREE(size_list);

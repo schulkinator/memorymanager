@@ -16,6 +16,8 @@ x64/
 *.lib
 *.dll
 *.user
+*.o
+*.gch
 
 
 # machine-specific config #
