@@ -20,9 +20,15 @@
 #include <intrin.h>
 #else
 // unix/linux variants, including OSX
-#include <unistd.h> // for sysconf
+#include <unistd.h> // for sysconf and gettid and brk() and sbrk()
+#include <sys/types.h> // for gettid & pid_t type
+#include <pthread.h> // for pthread_self()
 #include <sys/mman.h> // for mmap
 #include <immintrin.h> // for tzcnt/lzcnt intrinsic instructions
+#ifndef MAP_UNINITIALIZED
+// some distributions don't have this flag defined, but it should be safe to define it and use it regardless
+#define MAP_UNINITIALIZED 0x4000000 
+#endif
 #endif
 
 #if _MSC_VER >= 1200
@@ -76,24 +82,24 @@ n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES_UINT32(n-1))
 
 // Threading macros
 #ifdef _WIN32
-#define GET_CURRENT_THREAD_ID() ::GetCurrentThreadId()
+#define GET_CURRENT_THREAD_ID() static_cast<int>(::GetCurrentThreadId())
 #elif __APPLE__  
   #if TARGET_IPHONE_SIMULATOR
-  #define GET_CURRENT_THREAD_ID() static_cast<unsigned int>(pthread_mach_thread_np(pthread_self()))
+  #define GET_CURRENT_THREAD_ID() static_cast<int>(pthread_mach_thread_np(pthread_self()))
   // iOS Simulator
   #elif TARGET_OS_IPHONE
-  #define GET_CURRENT_THREAD_ID() static_cast<unsigned int>(pthread_mach_thread_np(pthread_self()))
+  #define GET_CURRENT_THREAD_ID() static_cast<int>(pthread_mach_thread_np(pthread_self()))
   // iOS device
   #elif TARGET_OS_MAC
-  #define GET_CURRENT_THREAD_ID() static_cast<unsigned int>(pthread_self())
+  #define GET_CURRENT_THREAD_ID() static_cast<int>(pthread_self())
   #else
   //#   error "Unknown Apple platform"
-  #define GET_CURRENT_THREAD_ID() static_cast<unsigned int>(pthread_self())
+  #define GET_CURRENT_THREAD_ID() static_cast<int>(pthread_self())
   #endif
 #elif __ANDROID__
-#define GET_CURRENT_THREAD_ID() static_cast<unsigned int>(gettid())
+#define GET_CURRENT_THREAD_ID() static_cast<int>(pthread_self())
 #elif __linux__
-#define GET_CURRENT_THREAD_ID() static_cast<unsigned int>(gettid())
+#define GET_CURRENT_THREAD_ID() static_cast<int>(pthread_self())
 #endif
 
 // kernel-level allocation/free functions. These allow us to jump over a level of function call overhead with malloc() for performance
@@ -121,17 +127,50 @@ struct _unix_thread_heap_ {
   void* heap_start;
   void* heap_end;
 };
+// for simplicity's sake we just make everything 8-bytes long to satisfy byte alignment after the header
+struct alignas(BYTE_ALIGNMENT) _thread_alloc_header_ {  
+  uint64_t size;
+  // bit 0 : 1 = currently in use, 0 = unused
+  uint64_t usage_flags;
+};
+std::mutex global_heap_mutex;
+// for simplicity's sake we just make everything 8-bytes long to satisfy byte alignment after the header
+struct alignas(BYTE_ALIGNMENT) _global_alloc_header_ {
+  uint64_t size;
+  // bit 0 : 1 = currently in use, 0 = unused
+  uint64_t usage_flags; 
+};
 // to allow each thread to have its own independent heap, we need to make sure each thread id maps to a unique region of virtual memory address space.
 // so we need to decide how much heap space each thread is allowed. We'll make the decision that 32k threads are allowed, dividing up the virtual memory address space into 32k equal parts.
 // We also assume that we'll be using a 64bit process and so most 64bit systems will allow up to 43bits of virtual address space (max address 0x7fff ffff ffff)
 // additionally, the program space itself will occupy an unknown amount of instruction, data, and heap space at the bottom of the virtual address space, 
 // and there will be stack space occupied up at the top of the virtual memory space (one stack per thread!)
 #define MAX_SUPPORTED_THREADS 32768
-#define KMALLOC(size) mmap(GET_CURRENT_THREAD_ID(), (size), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0)
-#define KREALLOC(ptr, size) mremap(ptr, size)
-#define KFREE(ptr) munmap((ptr), nbytes)
-#define KCALLOC(nitems, size) mmap(GET_CURRENT_THREAD_ID(), (nitems*size), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)
-#define GLOBAL_KMALLOC(size) brk(size)
+#define THREAD_ID_HASHED_ADDRESS reinterpret_cast<void*>(GET_CURRENT_THREAD_ID() % MAX_SUPPORTED_THREADS) * 1000
+#define KMALLOC(size) [](size_t sz) -> void* { \
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_)+(sz)), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0)); \
+  header->size = sz; \
+  header->usage_flags = 0x1; \
+  return reinterpret_cast<void*>(header) + sizeof(_thread_alloc_header_); \
+} (size)
+#define KREALLOC(ptr, size) [](void* p, size_t sz) -> void* { \
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(p - sizeof(_thread_alloc_header_)); \
+  header = reinterpret_cast<_thread_alloc_header_*>(mremap(header, sizeof(_thread_alloc_header_) + sz));  \
+  header->size = sz; \
+  return reinterpret_cast<void*>(header) + sizeof(_thread_alloc_header_); \
+} (ptr, size)
+#define KFREE(ptr) [](void* p) -> { \
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(p - sizeof(_thread_alloc_header_)); \
+  header->usage_flags = 0; \
+  munmap(header, sizeof(_thread_alloc_header_) + header->size); \
+} (ptr)
+#define KCALLOC(nitems, size) [](size_t n, size_t sz) -> void* { \
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + (n*sz)), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)); \
+  header->size = n*sz; \
+  header->usage_flags = 0x1; \
+  return reinterpret_cast<void*>(header) + sizeof(_thread_alloc_header_); \
+} (nitems, size)
+#define GLOBAL_KMALLOC(size) malloc(size)
 #define GLOBAL_KREALLOC(ptr, size) realloc(ptr, size)
 #define GLOBAL_KFREE(ptr) free(ptr)
 #define GLOBAL_KCALLOC(nitems, size) calloc(nitems, size)
@@ -264,7 +303,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     // beyond MAX_ALLOCATION_SIZE we don't care, we're more concerned about small allocations fragmenting memory    
     // stamp down a header to mark it as outside memory
     unsigned char* p = reinterpret_cast<unsigned char*>(KMALLOC(size + BYTE_ALIGNMENT));
-    if (!p) {
+    if (p <= 0) {
       // allocation failed
       error_handler();
       return nullptr;
@@ -278,7 +317,8 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   // allocations below the byte alignment size make no sense either (including zero size allocations)
   // But that will be enforced in the below CalculateCellSizeAndArenaIndexForAllocation()
   if (!MemoryManager::thread_state.thread_id) {
-    MemoryManager::thread_state.thread_id = GET_CURRENT_THREAD_ID(); // TODO: can this be in the static init instead of here?
+    int tid = GET_CURRENT_THREAD_ID(); // TODO: can this be in the static init instead of here?
+    MemoryManager::thread_state.thread_id = tid;
   }
   // The first sandbox in existence (the head of the list) is a special case, create it if it doesn't exist
   if (!MemoryManager::global_state.thread_memory_sandboxes) {
@@ -327,7 +367,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     // no arena collection was allocated for this allocation size yet, allocate it now    
     // since we use calloc, everything will be zero initialized for us
     arena_collection = reinterpret_cast<ArenaCollection*>(KCALLOC(1, sizeof(ArenaCollection)));
-    if (!arena_collection) {
+    if (arena_collection <= 0) {
       // arena collection allocation failed
       error_handler();
       return nullptr;
@@ -337,7 +377,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     arena_collection->derelict = false;
     MemoryManager::thread_state.thread_sandbox->arenas[arena_index] = arena_collection;
     arena_header = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
-    if (!arena_header) {
+    if (arena_header <= 0) {
       // the allocation failed
       error_handler();
       return nullptr;
@@ -359,7 +399,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     if (!arena_header->next) {
       // there's no next arena, allocate a new one
       arena_header->next = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
-      if (!arena_header->next) {
+      if (arena_header->next <= 0) {
         // the allocation failed
         error_handler();
         return nullptr;
@@ -437,14 +477,14 @@ MemoryManager::ThreadSandboxNode* MemoryManager::FindSandboxForThread(unsigned i
 }
 
 void MemoryManager::Deallocate(void* data, size_t size) {
-  // TODO: for the converse case where we're doing a dealloc, could also have another pointer to the last alloc'ed arena header to speed up scanning
-  // maybe a size of zero triggers a scan to figure out way to read the arena header from the data pointer? stamp down a pointer to the header in every cell?
   if (data == nullptr) {
     return;
   }
   // first, identify if this is an outside system allocation
-  // it should be safe to read into the memory behind the given pointer because in any scenario you're
-  // going to either read into a previous cell's memory, or you'll read into the arena header's dummy guard (that's why it's there)
+  // it should always be safe to read into the memory behind the given pointer because all scenarios are:
+  // 1.) it was a large allocation and you'll read into the "outside system marker" (this is the first thing we check for)
+  // 2.) you're going to read into a previous cell's memory
+  // 3.) you'll read into the arena header's dummy guard (that's why it's there)  
   unsigned char* behind_ptr = reinterpret_cast<unsigned char*>(data) - BYTE_ALIGNMENT;
   unsigned int* marker_ptr = reinterpret_cast<unsigned int*>(behind_ptr);
   if (size > MAX_CELL_SIZE || (*marker_ptr == OUTSIDE_SYSTEM_MARKER)) {
@@ -535,7 +575,7 @@ int MemoryManager::MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_san
       // We have to use the global heap here because otherwise we're allocating memory from an alien thread's heap and then when we shut down the deallocating thread tries to free memory that isn't in its own heap
       new_queue = reinterpret_cast<DeallocRequest*>(GLOBAL_KCALLOC(new_capacity, sizeof(DeallocRequest)));
     }
-    if (!new_queue) {
+    if (new_queue <= 0) {
       return 1;
     }
     owning_sandbox->dealloc_queue = new_queue;
@@ -552,9 +592,9 @@ int MemoryManager::MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_san
 MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id) {
   // since we use calloc, everything will be zero initialized for us
   ThreadSandboxNode* thread_sandbox = reinterpret_cast<ThreadSandboxNode*>(KCALLOC(1, sizeof(ThreadSandboxNode)));
-  if (!thread_sandbox) {
+  if (thread_sandbox <= 0) {
     // allocation failed
-    return nullptr;
+    return thread_sandbox;
   }
   if (tail_of_list) {
     tail_of_list->next = thread_sandbox;
@@ -589,8 +629,8 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   // each cell contains: a pointer to the arena header, some guard padding, then the cell data itself
   size_t arena_size = header_size + alignment_bytes + ((sizeof(CellHeader) + cell_size_without_header_bytes) * cell_capacity);
   unsigned char* raw_arena = reinterpret_cast<unsigned char*>(KMALLOC(arena_size));
-  if (!raw_arena) {
-    return nullptr;
+  if (raw_arena <= 0) {
+    return reinterpret_cast<ArenaHeader*>(raw_arena);
   }
 #if _MSC_VER >= 1200
   // visual studio will complain about a buffer overrun with the memset but that's not possible. arena_size can never be less than header_size.
@@ -607,7 +647,7 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   arena_header->cell_capacity = cell_capacity;
   // this works based on the property that a power of two alignment number like 8 for example (1000 in binary)
   // will be 0111 once we subtract 1, giving us our mask.
-  uint64_t padding_addr_mask = static_cast<unsigned int>(alignment_bytes - 1U);
+  uint64_t padding_addr_mask = static_cast<uint64_t>(alignment_bytes - 1U);
   // figure out how many bytes past the header we can start the arena in order to be byte-aligned
   unsigned char* raw_arena_past_header = raw_arena + header_size;
   // any bits of the address that land within the mask area will signal that raw_arena_past_header is not on an address that is a multiple of alignment_bytes
@@ -697,7 +737,9 @@ void MemoryManager::ThreadShutdown() {
     }    
   }
   // at this point if this is derelict thread memory then we don't proceed with the rest of the teardown for this thread
+  // because something is either still in use or there was a memory leak or some static destructor hasn't completed
   if (MemoryManager::thread_state.thread_sandbox->derelict) {
+    ////// we can't free this thread's memory normally, something is leaking or still in use ////////
     return;
   }
   {
@@ -846,12 +888,12 @@ void MemoryManager::Test_StochasticAllocDealloc() {
   // have to use calloc so that we avoid using the memory manager for this test code
   unsigned char** alloc_list = static_cast<unsigned char**>(KCALLOC(num_allocs, sizeof(unsigned char*)));
   unsigned int* size_list = static_cast<unsigned int*>(KCALLOC(num_allocs, sizeof(unsigned int)));
-  assert(alloc_list != nullptr);
-  if (alloc_list == nullptr) {
+  assert(alloc_list > 0);
+  if (alloc_list <= 0) {
     return;
   }
-  assert(size_list != nullptr);
-  if (size_list == nullptr) {
+  assert(size_list > 0);
+  if (size_list <= 0) {
     return;
   }
   // allocate and hold on to the memory

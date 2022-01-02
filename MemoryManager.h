@@ -200,7 +200,7 @@ public:
     ThreadState();
     // thread destructor, cleans up the memory allocated on this thread
     ~ThreadState();
-    unsigned int thread_id;
+    int thread_id;
     // the sandbox for this thread
     ThreadSandboxNode* thread_sandbox;
     unsigned int mm_dealloc_error_status; /* nonzero means error */
