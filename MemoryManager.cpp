@@ -57,7 +57,7 @@
 // TODO: these may not be supported by all compilers 
 // Looks like there is a swift-specific function on apple platforms: https://developer.apple.com/documentation/swift/int/2886165-trailingzerobitcount
 // list of gnu gcc supported instruction sets: https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html
-// caution: these instructions may be undefined if the value passed is zero
+// CAUTION: these instructions may be undefined if the value passed is zero
 #if defined _M_X64 || defined _M_IX86 || defined __x86_64__
   #define COUNT_NUM_TRAILING_ZEROES_UINT32(bits) _tzcnt_u32(bits) /* This is an x86 specific BMI instruction intrinsic */
 #else
@@ -116,9 +116,14 @@ n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES_UINT32(n-1))
 #define GET_CURRENT_THREAD_ID() static_cast<int>(pthread_self())
 #endif
 
+int MemoryManager::GetCurrentThreadID() {
+  thread_local static const int tid = GET_CURRENT_THREAD_ID();
+  return tid;
+}
+
 // kernel-level allocation/free functions. These allow us to jump over malloc() to ensure that our allocations are thread-specific
 #ifdef _WIN32
-HANDLE mm_proc_heap;
+HANDLE mm_proc_heap; // the process heap (common to all threads)
 thread_local HANDLE mm_thread_heap; // the thread-local heap handle (unique to each thread)
 SYSTEM_INFO mm_sys_info;
 #define KMALLOC(size) static_cast<void*>(HeapAlloc(mm_thread_heap, HEAP_NO_SERIALIZE, (size))) /* NOTE: we allow HEAP_NO_SERIALIZE because each thread has its own heap, so no synchronization is necessary */
@@ -134,11 +139,11 @@ SYSTEM_INFO mm_sys_info;
 /* mmap() is typically used for larger allocations that will occupy a whole page of memory (rounds the actual allocated size up to the nearest pagesize multiple). 
   internally mmap is expensive at the OS level, it has to flush TLBs, and respond to page faults (which is slow).
   brk()/sbrk() is typically used for smaller allocations and only marks the end of the heap, so it is limited. however it is much faster than mmap. */
-struct _unix_thread_heap_ {
-  uint32_t thread_id;
-  void* heap_start;
-  void* heap_end;
-};
+//struct _unix_thread_heap_ {
+//  uint32_t thread_id;
+//  void* heap_start;
+//  void* heap_end;
+//};
 // for simplicity's sake we just make everything 8-bytes long to satisfy byte alignment after the header
 struct alignas(BYTE_ALIGNMENT) _thread_alloc_header_ {  
   uint64_t alloc_size;
@@ -150,8 +155,8 @@ struct alignas(BYTE_ALIGNMENT) _thread_alloc_header_ {
 // We also assume that we'll be using a 64bit process and so most 64bit systems will allow up to 43bits of virtual address space (max address 0x7fff ffff ffff)
 // additionally, the program space itself will occupy an unknown amount of instruction, data, and heap space at the bottom of the virtual address space, 
 // and there will be stack space occupied up at the top of the virtual memory space (one stack per thread!)
-#define MAX_SUPPORTED_THREADS 32768
-#define THREAD_ID_HASHED_ADDRESS reinterpret_cast<void*>(GET_CURRENT_THREAD_ID() % MAX_SUPPORTED_THREADS) * 1000
+//#define MAX_SUPPORTED_THREADS 32768
+//#define THREAD_ID_HASHED_ADDRESS reinterpret_cast<void*>(MemoryManager::GetCurrentThreadID() % MAX_SUPPORTED_THREADS) * 1000
 inline void* Unix_Kmalloc(size_t sz) {
   //_thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + sz), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0));  // map uninitialized doesn't seem to work
   _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + sz), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)); // TODO: not sure if MAP_SHARED should be MAP_PRIVATE
@@ -161,6 +166,7 @@ inline void* Unix_Kmalloc(size_t sz) {
     return reinterpret_cast<unsigned char*>(header) + sizeof(_thread_alloc_header_);
   }
   // if this fails here, check errno for what mmap() might be failing with
+  //printf("errno %d\n", errno);
   return nullptr;
 }
 inline void* Unix_Realloc(void* p, size_t sz) {
@@ -171,6 +177,7 @@ inline void* Unix_Realloc(void* p, size_t sz) {
     return reinterpret_cast<unsigned char*>(header) + sizeof(_thread_alloc_header_);
   }
   // if this fails here, check errno for what mremap() might be failing with
+  //printf("errno %d\n", errno);
   return nullptr;
 }
 inline void* Unix_Kcalloc(size_t n, size_t sz) {  
@@ -181,6 +188,7 @@ inline void* Unix_Kcalloc(size_t n, size_t sz) {
     return reinterpret_cast<unsigned char*>(header) + sizeof(_thread_alloc_header_);
   }
   // if this fails here, check errno for what mmap() might be failing with
+  //printf("errno %d\n", errno);
   return nullptr;
 }
 inline void Unix_Kfree(void* p) {
@@ -273,7 +281,7 @@ void MemoryManager::ClearDeallocErrors() {
 // global state constructor
 MemoryManager::GlobalState::GlobalState() :
   base_arena_index(COUNT_NUM_TRAILING_ZEROES_UINT32(BYTE_ALIGNMENT)),
-  thread_memory_sandboxes(nullptr),
+  thread_sandbox_linked_list(nullptr),
   mm_global_error_status(0) {
 #ifdef _WIN32
   GetSystemInfo(&mm_sys_info);
@@ -328,24 +336,21 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   }
   // allocations below the byte alignment size make no sense either (including zero size allocations)
   // But that will be enforced in the below CalculateCellSizeAndArenaIndexForAllocation()
-  if (!MemoryManager::thread_state.thread_id) {
-    int tid = GET_CURRENT_THREAD_ID(); // TODO: can this be in the static init instead of here?
-    MemoryManager::thread_state.thread_id = tid;
-  }
+  MemoryManager::thread_state.thread_id = MemoryManager::GetCurrentThreadID();  
   // The first sandbox in existence (the head of the list) is a special case, create it if it doesn't exist
-  if (!MemoryManager::global_state.thread_memory_sandboxes) {
+  if (!MemoryManager::global_state.thread_sandbox_linked_list) {
     std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
     // double check that the thread_memory_sandbox is still null since we could get two
     // simultaneous threads blocking on that mutex at the exact same time, the loser thread
     // would need to not run this code
-    if (!MemoryManager::global_state.thread_memory_sandboxes) {
-      MemoryManager::global_state.thread_memory_sandboxes = (ThreadSandboxNode*)AllocateNewThreadSandbox(nullptr, MemoryManager::thread_state.thread_id);
-      if (!MemoryManager::global_state.thread_memory_sandboxes) {
+    if (!MemoryManager::global_state.thread_sandbox_linked_list) {
+      MemoryManager::global_state.thread_sandbox_linked_list = (ThreadSandboxNode*)AllocateNewThreadSandbox(nullptr, MemoryManager::thread_state.thread_id);
+      if (!MemoryManager::global_state.thread_sandbox_linked_list) {
         // thread sandbox allocation failed
         error_handler();
         return nullptr;
       }
-      MemoryManager::thread_state.thread_sandbox = MemoryManager::global_state.thread_memory_sandboxes;
+      MemoryManager::thread_state.thread_sandbox = MemoryManager::global_state.thread_sandbox_linked_list;
     }
   }
   ThreadSandboxNode* prev_sandbox = nullptr;
@@ -476,7 +481,7 @@ inline unsigned int MemoryManager::CalculateCellCapacityForArena(unsigned int ce
 }
 
 MemoryManager::ThreadSandboxNode* MemoryManager::FindSandboxForThread(unsigned int thread_id, ThreadSandboxNode*& last_node) {
-  ThreadSandboxNode* sandbox = MemoryManager::global_state.thread_memory_sandboxes;
+  ThreadSandboxNode* sandbox = MemoryManager::global_state.thread_sandbox_linked_list;
   // walk the linked list to find the memory sandbox for this thread
   while (sandbox) {
     if (sandbox->thread_id == thread_id) {
@@ -773,7 +778,7 @@ void MemoryManager::ThreadShutdown() {
     //  then we'll create a broken linked list for the rest of the system. Not good! 
     // So we need to wire up the next pointer of the previous sandbox to skip over this dead thread sandbox.
     ThreadSandboxNode* prev_node = nullptr;
-    ThreadSandboxNode* curr_node = MemoryManager::global_state.thread_memory_sandboxes;
+    ThreadSandboxNode* curr_node = MemoryManager::global_state.thread_sandbox_linked_list;
     while (curr_node && curr_node->thread_id != MemoryManager::thread_state.thread_sandbox->thread_id) {
       prev_node = curr_node;
       curr_node = curr_node->next;
@@ -781,9 +786,9 @@ void MemoryManager::ThreadShutdown() {
     if (prev_node && curr_node) {
       prev_node->next = curr_node->next;
     }
-    if (curr_node && curr_node == MemoryManager::global_state.thread_memory_sandboxes) {
+    if (curr_node && curr_node == MemoryManager::global_state.thread_sandbox_linked_list) {
       // it was the head of the linked list, so fix that
-      MemoryManager::global_state.thread_memory_sandboxes = curr_node->next;
+      MemoryManager::global_state.thread_sandbox_linked_list = curr_node->next;
     }
   }
   KFREE(MemoryManager::thread_state.thread_sandbox);
@@ -791,9 +796,9 @@ void MemoryManager::ThreadShutdown() {
   // TODO: we need to change this so that the last thread to exit destroys the main linked list of sandboxes
   // this should be safe as long as each thread already has its own thread-local sandbox cached
   //std::lock_guard<std::mutex> guard(sandbox_list_mutex);
-  //if (thread_memory_sandboxes != nullptr) {    
-  //  KFREE(thread_memory_sandboxes);
-  //  thread_memory_sandboxes = nullptr;
+  //if (thread_sandbox_linked_list != nullptr) {    
+  //  KFREE(thread_sandbox_linked_list);
+  //  thread_sandbox_linked_list = nullptr;
   //}
 }
 
@@ -823,7 +828,7 @@ void MemoryManager::Test_StandardAllocDealloc() {
   // make an alloc
   MMTestStructTiny* a = new MMTestStructTiny;
 
-  ThreadSandboxNode* sandbox = MemoryManager::global_state.thread_memory_sandboxes;
+  ThreadSandboxNode* sandbox = MemoryManager::global_state.thread_sandbox_linked_list;
   sandbox = FindSandboxForThread(MemoryManager::thread_state.thread_id, prev_sandbox);
   // the sandbox we searched for manually should match the sandbox for this thread in the thread state
   assert(sandbox == MemoryManager::thread_state.thread_sandbox); // "thread-local thread_sandbox does not match?"
@@ -1024,7 +1029,7 @@ void MemoryManager::Test_CrossThreadAllocDealloc() {
   {
     // NOTE: any time we walk the sandbox list we have to lock this mutex
     std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
-    sandbox = MemoryManager::global_state.thread_memory_sandboxes;
+    sandbox = MemoryManager::global_state.thread_sandbox_linked_list;
     int count_sandboxes = 0;
     while (sandbox) {
       count_sandboxes++;
