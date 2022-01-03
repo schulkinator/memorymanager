@@ -1,5 +1,5 @@
 CC = g++
-CFLAGS = -Wall -g
+CFLAGS = -Wall -g -pthread -march=native -v -da -Q
 
 default: main
 

@@ -1,0 +1,7 @@
+To debug the memory manager under linux, type:
+> make
+> gdb main
+gdb> run
+(main will halt at any segmentation faults)
+gdb> where
+gdb> list

@@ -11,6 +11,8 @@
 #include <stdint.h>
 #include <cassert>
 #include <unordered_set>
+#include <math.h>
+#include <cstring>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -24,7 +26,11 @@
 #include <sys/types.h> // for gettid & pid_t type
 #include <pthread.h> // for pthread_self()
 #include <sys/mman.h> // for mmap
-#include <immintrin.h> // for tzcnt/lzcnt intrinsic instructions
+#include <immintrin.h> // for tzcnt/lzcnt intrinsic bmi instructions
+#if defined _M_X64 || defined _M_IX86 || defined __x86_64__
+#include <x86intrin.h> // for tzcnt/lzcnt intrinsic bmi instructions on x86
+#endif
+#include <errno.h> // for errno
 #ifndef MAP_UNINITIALIZED
 // some distributions don't have this flag defined, but it should be safe to define it and use it regardless
 #define MAP_UNINITIALIZED 0x4000000 
@@ -50,10 +56,18 @@
 // For example the integer value 12 would return 2.
 // TODO: these may not be supported by all compilers 
 // Looks like there is a swift-specific function on apple platforms: https://developer.apple.com/documentation/swift/int/2886165-trailingzerobitcount
+// list of gnu gcc supported instruction sets: https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html
+// caution: these instructions may be undefined if the value passed is zero
 #if defined _M_X64 || defined _M_IX86 || defined __x86_64__
   #define COUNT_NUM_TRAILING_ZEROES_UINT32(bits) _tzcnt_u32(bits) /* This is an x86 specific BMI instruction intrinsic */
 #else
   #define COUNT_NUM_TRAILING_ZEROES_UINT32(bits) __builtin_ctz(bits)
+#endif
+
+#if defined _M_X64 || defined _M_IX86 || defined __x86_64__
+#define COUNT_NUM_TRAILING_ZEROES_UINT64(bits) _tzcnt_u64(bits) /* This is an x86 specific BMI instruction intrinsic */
+#else
+#define COUNT_NUM_TRAILING_ZEROES_UINT64(bits) __builtin_ctz(bits)
 #endif
 
 // Macro to count the leading number of zeros before the most significant bit.
@@ -102,7 +116,7 @@ n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES_UINT32(n-1))
 #define GET_CURRENT_THREAD_ID() static_cast<int>(pthread_self())
 #endif
 
-// kernel-level allocation/free functions. These allow us to jump over a level of function call overhead with malloc() for performance
+// kernel-level allocation/free functions. These allow us to jump over malloc() to ensure that our allocations are thread-specific
 #ifdef _WIN32
 HANDLE mm_proc_heap;
 thread_local HANDLE mm_thread_heap; // the thread-local heap handle (unique to each thread)
@@ -116,9 +130,7 @@ SYSTEM_INFO mm_sys_info;
 #define GLOBAL_KCALLOC(nitems, size) static_cast<void*>(HeapAlloc(mm_proc_heap, HEAP_ZERO_MEMORY, (nitems)*(size))) /* since this is the process heap, we must force serialization */
 #define GLOBAL_KFREE(ptr) HeapFree(mm_proc_heap, 0, (ptr)) /* since this is the process heap, we must force serialization */
 #define GET_SYS_PAGESIZE() (mm_sys_info.dwPageSize)
-#elif __APPLE__
-#elif __ANDROID__
-#elif __linux__
+#else
 /* mmap() is typically used for larger allocations that will occupy a whole page of memory (rounds the actual allocated size up to the nearest pagesize multiple). 
   internally mmap is expensive at the OS level, it has to flush TLBs, and respond to page faults (which is slow).
   brk()/sbrk() is typically used for smaller allocations and only marks the end of the heap, so it is limited. however it is much faster than mmap. */
@@ -129,16 +141,9 @@ struct _unix_thread_heap_ {
 };
 // for simplicity's sake we just make everything 8-bytes long to satisfy byte alignment after the header
 struct alignas(BYTE_ALIGNMENT) _thread_alloc_header_ {  
-  uint64_t size;
+  uint64_t alloc_size;
   // bit 0 : 1 = currently in use, 0 = unused
   uint64_t usage_flags;
-};
-std::mutex global_heap_mutex;
-// for simplicity's sake we just make everything 8-bytes long to satisfy byte alignment after the header
-struct alignas(BYTE_ALIGNMENT) _global_alloc_header_ {
-  uint64_t size;
-  // bit 0 : 1 = currently in use, 0 = unused
-  uint64_t usage_flags; 
 };
 // to allow each thread to have its own independent heap, we need to make sure each thread id maps to a unique region of virtual memory address space.
 // so we need to decide how much heap space each thread is allowed. We'll make the decision that 32k threads are allowed, dividing up the virtual memory address space into 32k equal parts.
@@ -147,39 +152,46 @@ struct alignas(BYTE_ALIGNMENT) _global_alloc_header_ {
 // and there will be stack space occupied up at the top of the virtual memory space (one stack per thread!)
 #define MAX_SUPPORTED_THREADS 32768
 #define THREAD_ID_HASHED_ADDRESS reinterpret_cast<void*>(GET_CURRENT_THREAD_ID() % MAX_SUPPORTED_THREADS) * 1000
-#define KMALLOC(size) [](size_t sz) -> void* { \
-  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_)+(sz)), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0)); \
-  header->size = sz; \
-  header->usage_flags = 0x1; \
-  return reinterpret_cast<void*>(header) + sizeof(_thread_alloc_header_); \
-} (size)
-#define KREALLOC(ptr, size) [](void* p, size_t sz) -> void* { \
-  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(p - sizeof(_thread_alloc_header_)); \
-  header = reinterpret_cast<_thread_alloc_header_*>(mremap(header, sizeof(_thread_alloc_header_) + sz));  \
-  header->size = sz; \
-  return reinterpret_cast<void*>(header) + sizeof(_thread_alloc_header_); \
-} (ptr, size)
-#define KFREE(ptr) [](void* p) -> { \
-  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(p - sizeof(_thread_alloc_header_)); \
-  header->usage_flags = 0; \
-  munmap(header, sizeof(_thread_alloc_header_) + header->size); \
-} (ptr)
-#define KCALLOC(nitems, size) [](size_t n, size_t sz) -> void* { \
-  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + (n*sz)), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)); \
-  header->size = n*sz; \
-  header->usage_flags = 0x1; \
-  return reinterpret_cast<void*>(header) + sizeof(_thread_alloc_header_); \
-} (nitems, size)
-#define GLOBAL_KMALLOC(size) malloc(size)
-#define GLOBAL_KREALLOC(ptr, size) realloc(ptr, size)
-#define GLOBAL_KFREE(ptr) free(ptr)
-#define GLOBAL_KCALLOC(nitems, size) calloc(nitems, size)
-#define GET_SYS_PAGESIZE() sysconf(_SC_PAGE_SIZE)
-#else
-#define KMALLOC(size) malloc(size)
-#define KREALLOC(ptr, size) realloc(ptr, size)
-#define KFREE(ptr) free(ptr)
-#define KCALLOC(nitems, size) calloc(nitems, size)
+inline void* Unix_Kmalloc(size_t sz) {
+  //_thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + sz), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0));  // map uninitialized doesn't seem to work
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + sz), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)); // TODO: not sure if MAP_SHARED should be MAP_PRIVATE
+  if (header != MAP_FAILED) {
+    header->alloc_size = sz;
+    header->usage_flags = 0x1;
+    return reinterpret_cast<unsigned char*>(header) + sizeof(_thread_alloc_header_);
+  }
+  // if this fails here, check errno for what mmap() might be failing with
+  return nullptr;
+}
+inline void* Unix_Realloc(void* p, size_t sz) {
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(p - sizeof(_thread_alloc_header_));
+  header = reinterpret_cast<_thread_alloc_header_*>(mremap(header, sizeof(_thread_alloc_header_) + header->alloc_size, sizeof(_thread_alloc_header_) + sz, MREMAP_MAYMOVE));
+  if (header != MAP_FAILED) {
+    header->alloc_size = sz;
+    return reinterpret_cast<unsigned char*>(header) + sizeof(_thread_alloc_header_);
+  }
+  // if this fails here, check errno for what mremap() might be failing with
+  return nullptr;
+}
+inline void* Unix_Kcalloc(size_t n, size_t sz) {  
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + (n * sz)), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)); // TODO: not sure if MAP_SHARED should be MAP_PRIVATE
+  if (header != MAP_FAILED) {
+    header->alloc_size = n * sz;
+    header->usage_flags = 0x1;
+    return reinterpret_cast<unsigned char*>(header) + sizeof(_thread_alloc_header_);
+  }
+  // if this fails here, check errno for what mmap() might be failing with
+  return nullptr;
+}
+inline void Unix_Kfree(void* p) {
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(p - sizeof(_thread_alloc_header_));
+  header->usage_flags = 0;
+  munmap(header, sizeof(_thread_alloc_header_) + header->alloc_size);
+}
+#define KMALLOC(size) Unix_Kmalloc(size)
+#define KREALLOC(ptr, size) Unix_Realloc(ptr, size)
+#define KFREE(ptr) Unix_Kfree(ptr)
+#define KCALLOC(nitems, size) Unix_Kcalloc(nitems, size)
 #define GLOBAL_KMALLOC(size) malloc(size)
 #define GLOBAL_KREALLOC(ptr, size) realloc(ptr, size)
 #define GLOBAL_KFREE(ptr) free(ptr)
@@ -303,7 +315,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     // beyond MAX_ALLOCATION_SIZE we don't care, we're more concerned about small allocations fragmenting memory    
     // stamp down a header to mark it as outside memory
     unsigned char* p = reinterpret_cast<unsigned char*>(KMALLOC(size + BYTE_ALIGNMENT));
-    if (p <= 0) {
+    if (reinterpret_cast<int64_t>(p) <= 0) {
       // allocation failed
       error_handler();
       return nullptr;
@@ -367,7 +379,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     // no arena collection was allocated for this allocation size yet, allocate it now    
     // since we use calloc, everything will be zero initialized for us
     arena_collection = reinterpret_cast<ArenaCollection*>(KCALLOC(1, sizeof(ArenaCollection)));
-    if (arena_collection <= 0) {
+    if (reinterpret_cast<int64_t>(arena_collection) <= 0) {
       // arena collection allocation failed
       error_handler();
       return nullptr;
@@ -377,7 +389,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     arena_collection->derelict = false;
     MemoryManager::thread_state.thread_sandbox->arenas[arena_index] = arena_collection;
     arena_header = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
-    if (arena_header <= 0) {
+    if (reinterpret_cast<int64_t>(arena_header) <= 0) {
       // the allocation failed
       error_handler();
       return nullptr;
@@ -399,7 +411,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     if (!arena_header->next) {
       // there's no next arena, allocate a new one
       arena_header->next = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
-      if (arena_header->next <= 0) {
+      if (reinterpret_cast<int64_t>(arena_header->next) <= 0) {
         // the allocation failed
         error_handler();
         return nullptr;
@@ -409,14 +421,15 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   }
   // track this arena as having a recent cell allocation
   arena_collection->recent_alloc_arena = arena_header;
-  // we've found an arena with unoccupied cells, find a cell to occupy and mark it
-  // TODO: there's got to be a clever bit-manipulation way to do this
-  unsigned long long cell_occupation_bits = arena_header->cell_occupation_bits;
-  unsigned int cell_index = 0;
-  while ((cell_occupation_bits & 1ULL) == 1) {
-    cell_occupation_bits = cell_occupation_bits >> 1;
-    cell_index++;
-  }
+  // we've found an arena with unoccupied cells, find a cell to occupy and mark it  
+  //  - if we invert the bits of cell_occupation_bits use COUNT_NUM_TRAILING_ZEROES_UINT64, that would find the index of the first unset bit (the first empty cell)
+  //unsigned long long cell_occupation_bits = arena_header->cell_occupation_bits;
+  // NOTE: we don't have to worry about feeding COUNT_NUM_TRAILING_ZEROES_UINT64 a zero value here (causing it to blow up) because above we guarantee that we don't consider full arenas, ~(all bits set) is zero
+  unsigned int cell_index = COUNT_NUM_TRAILING_ZEROES_UINT64(~arena_header->cell_occupation_bits);
+  //while ((cell_occupation_bits & 1ULL) == 1) {
+  //  cell_occupation_bits = cell_occupation_bits >> 1;
+  //  cell_index++;
+  //}
   // found it, mark it as occupied
   arena_header->num_cells_occupied++;
   arena_header->cell_occupation_bits = arena_header->cell_occupation_bits | (1ULL << cell_index);
@@ -629,7 +642,7 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   // each cell contains: a pointer to the arena header, some guard padding, then the cell data itself
   size_t arena_size = header_size + alignment_bytes + ((sizeof(CellHeader) + cell_size_without_header_bytes) * cell_capacity);
   unsigned char* raw_arena = reinterpret_cast<unsigned char*>(KMALLOC(arena_size));
-  if (raw_arena <= 0) {
+  if (reinterpret_cast<int64_t>(raw_arena) <= 0) {
     return reinterpret_cast<ArenaHeader*>(raw_arena);
   }
 #if _MSC_VER >= 1200
@@ -989,13 +1002,19 @@ void MemoryManager::Test_CrossThreadAllocDealloc() {
     uint64_t thing1;
   };
   // make allocs on different threads and dealloc across threads
+  // alloc on the main thread
   MMTestStructTiny* a = new MMTestStructTiny;
-  std::atomic<bool> t1_done = false;
-  std::thread t1([&a, &t1_done]() {
+  std::atomic<bool> t1_done(false);
+  std::atomic<bool> t1_allowed_exit(false);
+  std::thread t1([&a, &t1_done, &t1_allowed_exit]() {
+    // dealloc on thread t1
     delete a;
     t1_done = true;
+    // wait for the main thread to allow t1 to exit
+    while (!t1_allowed_exit.load()) {
+    }
     });
-  // block and wait until t1 finishes (but don't let the thread exit yet, since that would trigger the thread shutdown code)
+  // block main thread and wait until t1 finishes (but don't let the thread exit yet, since that would trigger the thread shutdown code)
   while (!t1_done.load()) {
   }
   // do an alloc back on the main thread to trigger the dealloc
@@ -1030,9 +1049,11 @@ void MemoryManager::Test_CrossThreadAllocDealloc() {
       assert(MemoryManager::thread_state.mm_alloc_error_status == 0);
       assert(MemoryManager::thread_state.mm_dealloc_error_status == 0);
       sandbox = sandbox->next;
-    }
+    }    
     assert(count_sandboxes == 2);
   }
+  // now allow the t1 thread to exit
+  t1_allowed_exit = true;
   delete a;
   t1.join();
 }
