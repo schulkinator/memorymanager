@@ -116,10 +116,6 @@ n == 1 ? 1 : 1<<(32-COUNT_NUM_LEADING_ZEROES_UINT32(n-1))
 #define GET_CURRENT_THREAD_ID() static_cast<int>(pthread_self())
 #endif
 
-int MemoryManager::GetCurrentThreadID() {
-  thread_local static const int tid = GET_CURRENT_THREAD_ID();
-  return tid;
-}
 
 // kernel-level allocation/free functions. These allow us to jump over malloc() to ensure that our allocations are thread-specific
 #ifdef _WIN32
@@ -260,22 +256,22 @@ void operator delete[](void* p) {
 #endif
 
 void MemoryManager::HandleAllocErrorThrow() {
-  MemoryManager::thread_state.mm_alloc_error_status = 1;
+  MemoryManager::GetThreadState().mm_alloc_error_status = 1;
   throw std::bad_alloc();
 }
 
 void MemoryManager::HandleAllocErrorNoThrow() noexcept {
-  MemoryManager::thread_state.mm_alloc_error_status = 1;
+  MemoryManager::GetThreadState().mm_alloc_error_status = 1;
 }
 
 void MemoryManager::ClearAllocErrors() {
   // clears alloc errors on this thread (each thread has its own error status)
-  MemoryManager::thread_state.mm_alloc_error_status = 0;
+  MemoryManager::GetThreadState().mm_alloc_error_status = 0;
 }
 
 void MemoryManager::ClearDeallocErrors() {
   // clears dealloc errors on this thread (each thread has its own error status)
-  MemoryManager::thread_state.mm_dealloc_error_status = 0;
+  MemoryManager::GetThreadState().mm_dealloc_error_status = 0;
 }
 
 // global state constructor
@@ -292,7 +288,25 @@ MemoryManager::GlobalState::GlobalState() :
   }
 #endif
 }
-MemoryManager::GlobalState MemoryManager::global_state;
+// global state destructor. called when the process is exiting
+MemoryManager::GlobalState::~GlobalState() {
+}
+
+MemoryManager::ThreadState& MemoryManager::GetThreadState() {
+  // the ThreadState constructor runs here if it hasn't already on this thread
+  // then when the thread shuts down the destructor will run
+  // (uses C++ static initialization-on-first-use)
+  static thread_local ThreadState thread_state;
+  return thread_state;
+}
+
+MemoryManager::GlobalState& MemoryManager::GetGlobalState() {
+  // the ThreadState constructor runs here if it hasn't already (on any thread)
+  // then when the main process exits the destructor will run
+  // (uses C++ static initialization-on-first-use)
+  static GlobalState global_state;
+  return global_state;
+}
 
 ////// Each thread will have its own global state here //////
 // thread constructor
@@ -300,20 +314,20 @@ MemoryManager::ThreadState::ThreadState() :
   mm_dealloc_error_status(0), 
   mm_alloc_error_status(0), 
   thread_sandbox(nullptr),
-  thread_id(0) {
+  thread_id(GET_CURRENT_THREAD_ID()) {
 #ifdef _WIN32
   // create a heap for this thread and don't use thread synchronization to protect allocations (we have our own thread protection mechanism)
   mm_thread_heap = HeapCreate(HEAP_NO_SERIALIZE, 0, 0);
 #endif
 }
-// thread destructor
+// thread destructor gets called when the thread exits
 MemoryManager::ThreadState::~ThreadState() {
   MemoryManager::ThreadShutdown();
 #ifdef _WIN32
   HeapDestroy(mm_thread_heap);
 #endif
 }
-thread_local MemoryManager::ThreadState MemoryManager::thread_state;
+
 
 void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   if (size == 0) {
@@ -334,37 +348,39 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     p += BYTE_ALIGNMENT;
     return reinterpret_cast<void*>(p);
   }
+  // very first thing we must do before allocating is get the thread state and global state (uses C++ static initialization-on-first-use)
+  MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
+  MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
   // allocations below the byte alignment size make no sense either (including zero size allocations)
-  // But that will be enforced in the below CalculateCellSizeAndArenaIndexForAllocation()
-  MemoryManager::thread_state.thread_id = MemoryManager::GetCurrentThreadID();  
+  // But that will be enforced in the below CalculateCellSizeAndArenaIndexForAllocation()  
   // The first sandbox in existence (the head of the list) is a special case, create it if it doesn't exist
-  if (!MemoryManager::global_state.thread_sandbox_linked_list) {
-    std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
+  if (!global_state.thread_sandbox_linked_list) {
+    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
     // double check that the thread_memory_sandbox is still null since we could get two
     // simultaneous threads blocking on that mutex at the exact same time, the loser thread
     // would need to not run this code
-    if (!MemoryManager::global_state.thread_sandbox_linked_list) {
-      MemoryManager::global_state.thread_sandbox_linked_list = (ThreadSandboxNode*)AllocateNewThreadSandbox(nullptr, MemoryManager::thread_state.thread_id);
-      if (!MemoryManager::global_state.thread_sandbox_linked_list) {
+    if (!global_state.thread_sandbox_linked_list) {
+      global_state.thread_sandbox_linked_list = (ThreadSandboxNode*)AllocateNewThreadSandbox(nullptr, thread_state.thread_id);
+      if (!global_state.thread_sandbox_linked_list) {
         // thread sandbox allocation failed
         error_handler();
         return nullptr;
       }
-      MemoryManager::thread_state.thread_sandbox = MemoryManager::global_state.thread_sandbox_linked_list;
+      thread_state.thread_sandbox = global_state.thread_sandbox_linked_list;
     }
   }
   ThreadSandboxNode* prev_sandbox = nullptr;
-  if (!MemoryManager::thread_state.thread_sandbox) {
+  if (!thread_state.thread_sandbox) {
     // we need a mutex lock any time we walk the full sandbox list since other threads can alter it if they are shut down
-    std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
-    MemoryManager::thread_state.thread_sandbox = FindSandboxForThread(MemoryManager::thread_state.thread_id, prev_sandbox);
+    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
+    thread_state.thread_sandbox = FindSandboxForThread(thread_state.thread_id, prev_sandbox);
   }
-  if (!MemoryManager::thread_state.thread_sandbox) {
+  if (!thread_state.thread_sandbox) {
     // we did not find a sandbox for this thread, we must make one
     // only one thread at a time is allowed to make a new sandbox
-    std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
-    MemoryManager::thread_state.thread_sandbox = AllocateNewThreadSandbox(prev_sandbox, MemoryManager::thread_state.thread_id);
-    if (!MemoryManager::thread_state.thread_sandbox) {
+    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
+    thread_state.thread_sandbox = AllocateNewThreadSandbox(prev_sandbox, thread_state.thread_id);
+    if (!thread_state.thread_sandbox) {
       // thread sandbox allocation failed
       error_handler();
       return nullptr;
@@ -372,13 +388,13 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   }
   // now we can process the sandbox
   // first, do we have any cross-thread dealloc requests to handle?
-  ProcessDeallocationRequests(MemoryManager::thread_state.thread_sandbox);
+  ProcessDeallocationRequests(thread_state.thread_sandbox);
   // which cell size do we need for this allocation? (doesn't make sense to allocate anything smaller than BYTE_ALIGNMENT number of bytes)
   unsigned int cell_size_without_header = 0;
   unsigned int arena_index = 0;
   cell_size_without_header = CalculateCellSizeAndArenaIndexForAllocation(size, arena_index);
   // now we can grab the arena collection
-  ArenaCollection* arena_collection = MemoryManager::thread_state.thread_sandbox->arenas[arena_index];
+  ArenaCollection* arena_collection = thread_state.thread_sandbox->arenas[arena_index];
   ArenaHeader* arena_header = nullptr;
   if (!arena_collection) {
     // no arena collection was allocated for this allocation size yet, allocate it now    
@@ -390,9 +406,9 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
       return nullptr;
     }    
     arena_collection->cell_size_bytes = cell_size_without_header;
-    arena_collection->sandbox = MemoryManager::thread_state.thread_sandbox;
+    arena_collection->sandbox = thread_state.thread_sandbox;
     arena_collection->derelict = false;
-    MemoryManager::thread_state.thread_sandbox->arenas[arena_index] = arena_collection;
+    thread_state.thread_sandbox->arenas[arena_index] = arena_collection;
     arena_header = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
     if (reinterpret_cast<int64_t>(arena_header) <= 0) {
       // the allocation failed
@@ -472,7 +488,7 @@ inline unsigned int MemoryManager::CalculateCellSizeAndArenaIndexForAllocation(s
   // if we're guaranteed that cell_size_without_header is a power of two, 
   // then we can use a shortcut to calculate the arena index by counting the number of trailing zeroes in the cell size
   arena_index = COUNT_NUM_TRAILING_ZEROES_UINT32(cell_size_without_header);
-  arena_index = arena_index - MemoryManager::global_state.base_arena_index;
+  arena_index = arena_index - MemoryManager::GetGlobalState().base_arena_index;
   return cell_size_without_header;
 }
 
@@ -481,7 +497,7 @@ inline unsigned int MemoryManager::CalculateCellCapacityForArena(unsigned int ce
 }
 
 MemoryManager::ThreadSandboxNode* MemoryManager::FindSandboxForThread(unsigned int thread_id, ThreadSandboxNode*& last_node) {
-  ThreadSandboxNode* sandbox = MemoryManager::global_state.thread_sandbox_linked_list;
+  ThreadSandboxNode* sandbox = MemoryManager::GetGlobalState().thread_sandbox_linked_list;
   // walk the linked list to find the memory sandbox for this thread
   while (sandbox) {
     if (sandbox->thread_id == thread_id) {
@@ -510,25 +526,25 @@ void MemoryManager::Deallocate(void* data, size_t size) {
     KFREE(behind_ptr);
     return;
   }
-  // next we need to identify which sandbox this memory belongs to and if this is a cross-thread deallocation
-  if (!MemoryManager::thread_state.thread_id) {
-    MemoryManager::thread_state.thread_id = GET_CURRENT_THREAD_ID();
-  }
+  // very first thing we must do before deallocating is get the thread state and global state (uses C++ static initialization-on-first-use)
+  MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
+  MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
+  // next we need to identify which sandbox this memory belongs to and if this is a cross-thread deallocation  
   ThreadSandboxNode* prev_sandbox = nullptr;
-  if (!MemoryManager::thread_state.thread_sandbox) {
+  if (!thread_state.thread_sandbox) {
     // we need a mutex lock any time we walk the full sandbox list since other threads can alter it if they are shut down
-    std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
-    MemoryManager::thread_state.thread_sandbox = FindSandboxForThread(MemoryManager::thread_state.thread_id, prev_sandbox);
+    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
+    thread_state.thread_sandbox = FindSandboxForThread(thread_state.thread_id, prev_sandbox);
   }
-  if (!MemoryManager::thread_state.thread_sandbox) {
+  if (!thread_state.thread_sandbox) {
     // we did not find a sandbox for this thread, we must make one
     // only one thread at a time is allowed to make a new sandbox
-    std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
-    MemoryManager::thread_state.thread_sandbox = AllocateNewThreadSandbox(prev_sandbox, MemoryManager::thread_state.thread_id);
+    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
+    thread_state.thread_sandbox = AllocateNewThreadSandbox(prev_sandbox, thread_state.thread_id);
   }
-  if (!MemoryManager::thread_state.thread_sandbox) {
+  if (!thread_state.thread_sandbox) {
     // we didn't find the sandbox for this thread. Something really bad must've happened!    
-    MemoryManager::thread_state.mm_dealloc_error_status |= 1;
+    thread_state.mm_dealloc_error_status |= 1;
     return;
   }
   // we can look up the arena directly here by looking in the cell header
@@ -542,7 +558,7 @@ void MemoryManager::Deallocate(void* data, size_t size) {
     arena_header = cell_header->arena_header;
   }
   if (!arena_header || arena_header->dummy_guard != VALID_ARENA_HEADER_MARKER) {
-    MemoryManager::thread_state.mm_dealloc_error_status |= 2;
+    thread_state.mm_dealloc_error_status |= 2;
     return;
   }
   // we have a valid arena header!
@@ -550,15 +566,15 @@ void MemoryManager::Deallocate(void* data, size_t size) {
   ArenaCollection* arena_collection = arena_header->arena_collection;
   ThreadSandboxNode* owning_sandbox = arena_collection->sandbox;
   if (!owning_sandbox) {
-    MemoryManager::thread_state.mm_dealloc_error_status |= 4;
+    thread_state.mm_dealloc_error_status |= 4;
     return;
   }
-  bool thread_safe = owning_sandbox->thread_id == MemoryManager::thread_state.thread_id;
+  bool thread_safe = owning_sandbox->thread_id == thread_state.thread_id;
   if (!thread_safe) {
     // we don't own this memory, so we can't deallocate it here. make a dealloc request on the owning sandbox
     int dealloc_status = MakeDeallocRequestOnOtherThread(owning_sandbox, data, size);
     if (dealloc_status) {
-      MemoryManager::thread_state.mm_dealloc_error_status |= 8;
+      thread_state.mm_dealloc_error_status |= 8;
       return;
     }
     return;
@@ -697,20 +713,23 @@ void MemoryManager::ThreadShutdown() {
   //     (because it blasted a big hole in the contiguous heap memory where this thread had memory allocated)
   //     So to fix this, we need an exiting thread to transfer ownership of its memory to another active thread, 
   //     and then only the last thread exiting does the actual free()
-  if (!MemoryManager::thread_state.thread_sandbox) {
+  // very first thing we must do is get the thread state and global state (uses C++ static initialization-on-first-use)
+  MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
+  MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
+  if (!thread_state.thread_sandbox) {
     // we're going to walk the sandbox linked list, so lock the mutex  
-    std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
+    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
     ThreadSandboxNode* prev_sandbox = nullptr;
-    MemoryManager::thread_state.thread_sandbox = FindSandboxForThread(MemoryManager::thread_state.thread_id, prev_sandbox);
+    thread_state.thread_sandbox = FindSandboxForThread(thread_state.thread_id, prev_sandbox);
   }
-  if (!MemoryManager::thread_state.thread_sandbox) {
+  if (!thread_state.thread_sandbox) {
     return;
   }
   // process queued deallocs from other threads if there are any waiting
-  ProcessDeallocationRequests(MemoryManager::thread_state.thread_sandbox);
+  ProcessDeallocationRequests(thread_state.thread_sandbox);
   // kill all the arenas for this thread
-  for (uint32_t i = 0; i < MemoryManager::thread_state.thread_sandbox->num_arena_sizes; ++i) {
-    ArenaCollection* arena_collection = MemoryManager::thread_state.thread_sandbox->arenas[i];
+  for (uint32_t i = 0; i < thread_state.thread_sandbox->num_arena_sizes; ++i) {
+    ArenaCollection* arena_collection = thread_state.thread_sandbox->arenas[i];
     // its totally valid (and intentional) for arena collections to be left null, so avoid that
     if (!arena_collection) {
       continue;
@@ -729,7 +748,7 @@ void MemoryManager::ThreadShutdown() {
         // uh oh, we have encountered some derelict memory. 
         // Someone didn't deallocate before the thread exited (usually caused by static destructors)
         // now we need to mark the hierarchy as derelict and keep this link intact.
-        MEM_MGR_LOG("Encountered derelict memory on thread %d", MemoryManager::thread_state.thread_id);
+        MEM_MGR_LOG("Memory Manager - Encountered derelict memory on thread %d", thread_state.thread_id);
         if (!arena_collection->first) {
           // wire it up as the new head of the linked list if none present
           arena_collection->first = arena_header;
@@ -741,7 +760,7 @@ void MemoryManager::ThreadShutdown() {
         arena_header_curr_derelict = arena_header;
         arena_header->derelict = true;
         arena_collection->derelict = true;
-        MemoryManager::thread_state.thread_sandbox->derelict = true;
+        thread_state.thread_sandbox->derelict = true;
         arena_header = arena_header->next;
       }      
     }
@@ -751,59 +770,62 @@ void MemoryManager::ThreadShutdown() {
     }
     if (!arena_collection->derelict) {
       KFREE(arena_collection);
-      MemoryManager::thread_state.thread_sandbox->arenas[i] = nullptr;
+      thread_state.thread_sandbox->arenas[i] = nullptr;
     }    
   }
   // at this point if this is derelict thread memory then we don't proceed with the rest of the teardown for this thread
   // because something is either still in use or there was a memory leak or some static destructor hasn't completed
-  if (MemoryManager::thread_state.thread_sandbox->derelict) {
+  if (thread_state.thread_sandbox->derelict) {
     ////// we can't free this thread's memory normally, something is leaking or still in use ////////
     return;
   }
   {
     // deallocate the dealloc_queue for this thread
     // we need to mess with the queue for this sandbox, so lock the dealloc queue mutex
-    std::lock_guard<std::mutex> guard(MemoryManager::thread_state.thread_sandbox->dealloc_mutex);
+    std::lock_guard<std::mutex> guard(thread_state.thread_sandbox->dealloc_mutex);
     // the dealloc queue is allocated on the global process heap, so must use the corresponding free for that
-    GLOBAL_KFREE(MemoryManager::thread_state.thread_sandbox->dealloc_queue);
-    MemoryManager::thread_state.thread_sandbox->dealloc_queue = nullptr;
-    MemoryManager::thread_state.thread_sandbox->num_deallocs_queued = 0;
-    MemoryManager::thread_state.thread_sandbox->deallocs_capacity = 0;
+    GLOBAL_KFREE(thread_state.thread_sandbox->dealloc_queue);
+    thread_state.thread_sandbox->dealloc_queue = nullptr;
+    thread_state.thread_sandbox->num_deallocs_queued = 0;
+    thread_state.thread_sandbox->deallocs_capacity = 0;
   }
+  // now we need to remove the sandbox from the sandbox linked list
   {
     // we're going to need to mess with the sandbox linked list, so lock the mutex  
-    std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
+    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
     // Threads can come in and out of existence all the time, if our
     //  thread exit behavior is that we kill one of the sandboxes in the sandbox linked list
     //  then we'll create a broken linked list for the rest of the system. Not good! 
     // So we need to wire up the next pointer of the previous sandbox to skip over this dead thread sandbox.
     ThreadSandboxNode* prev_node = nullptr;
-    ThreadSandboxNode* curr_node = MemoryManager::global_state.thread_sandbox_linked_list;
-    while (curr_node && curr_node->thread_id != MemoryManager::thread_state.thread_sandbox->thread_id) {
+    ThreadSandboxNode* curr_node = global_state.thread_sandbox_linked_list;
+    while (curr_node && curr_node->thread_id != thread_state.thread_sandbox->thread_id) {
       prev_node = curr_node;
       curr_node = curr_node->next;
     }
     if (prev_node && curr_node) {
       prev_node->next = curr_node->next;
     }
-    if (curr_node && curr_node == MemoryManager::global_state.thread_sandbox_linked_list) {
+    if (curr_node && curr_node == global_state.thread_sandbox_linked_list) {
       // it was the head of the linked list, so fix that
-      MemoryManager::global_state.thread_sandbox_linked_list = curr_node->next;
+      global_state.thread_sandbox_linked_list = curr_node->next;
     }
   }
-  KFREE(MemoryManager::thread_state.thread_sandbox);
-  MemoryManager::thread_state.thread_sandbox = nullptr;
+  KFREE(thread_state.thread_sandbox);
+  thread_state.thread_sandbox = nullptr;
   // TODO: we need to change this so that the last thread to exit destroys the main linked list of sandboxes
   // this should be safe as long as each thread already has its own thread-local sandbox cached
-  //std::lock_guard<std::mutex> guard(sandbox_list_mutex);
-  //if (thread_sandbox_linked_list != nullptr) {    
-  //  KFREE(thread_sandbox_linked_list);
-  //  thread_sandbox_linked_list = nullptr;
+  //std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
+  //if (global_state.thread_sandbox_linked_list != nullptr) {    
+  //  KFREE(global_state.thread_sandbox_linked_list);
+  //  global_state.thread_sandbox_linked_list = nullptr;
   //}
 }
 
 void MemoryManager::Test_StandardAllocDealloc() {
-  assert(MemoryManager::global_state.base_arena_index == COUNT_NUM_TRAILING_ZEROES_UINT32(BYTE_ALIGNMENT));
+  MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
+  MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
+  assert(global_state.base_arena_index == COUNT_NUM_TRAILING_ZEROES_UINT32(BYTE_ALIGNMENT));
   // 8 byte object
   struct MMTestStructTiny {
     uint64_t thing1;
@@ -819,19 +841,17 @@ void MemoryManager::Test_StandardAllocDealloc() {
     
   // first find our thread sandbox
   ThreadSandboxNode* prev_sandbox = nullptr;
-  if (!MemoryManager::thread_state.thread_id) {
-    MemoryManager::thread_state.thread_id = GET_CURRENT_THREAD_ID();
-  }
+
   MemoryManager::ClearAllocErrors();
   MemoryManager::ClearDeallocErrors();
     
   // make an alloc
   MMTestStructTiny* a = new MMTestStructTiny;
 
-  ThreadSandboxNode* sandbox = MemoryManager::global_state.thread_sandbox_linked_list;
-  sandbox = FindSandboxForThread(MemoryManager::thread_state.thread_id, prev_sandbox);
+  ThreadSandboxNode* sandbox = global_state.thread_sandbox_linked_list;
+  sandbox = FindSandboxForThread(GET_CURRENT_THREAD_ID(), prev_sandbox);
   // the sandbox we searched for manually should match the sandbox for this thread in the thread state
-  assert(sandbox == MemoryManager::thread_state.thread_sandbox); // "thread-local thread_sandbox does not match?"
+  assert(sandbox == thread_state.thread_sandbox); // "thread-local thread_sandbox does not match?"
 
   // validate global state
   ArenaCollection* collection = sandbox->arenas[0];
@@ -845,7 +865,7 @@ void MemoryManager::Test_StandardAllocDealloc() {
   assert(arena_header->num_cells_occupied == 1);
   assert(arena_header->next == nullptr);
   assert(arena_header->dummy_guard == VALID_ARENA_HEADER_MARKER);    
-  assert(MemoryManager::thread_state.mm_alloc_error_status == 0);
+  assert(thread_state.mm_alloc_error_status == 0);
 
   // make another alloc
   MMTestStructMedium* b = new MMTestStructMedium;
@@ -861,7 +881,7 @@ void MemoryManager::Test_StandardAllocDealloc() {
   assert(arena_header->num_cells_occupied == 1);
   assert(arena_header->next == nullptr);
   assert(arena_header->dummy_guard == VALID_ARENA_HEADER_MARKER);
-  assert(MemoryManager::thread_state.mm_alloc_error_status == 0);
+  assert(thread_state.mm_alloc_error_status == 0);
 
   // make a dealloc
   delete b;
@@ -877,7 +897,7 @@ void MemoryManager::Test_StandardAllocDealloc() {
   assert(arena_header->num_cells_occupied == 0);
   assert(arena_header->next == nullptr);
   assert(arena_header->dummy_guard == VALID_ARENA_HEADER_MARKER);
-  assert(MemoryManager::thread_state.mm_dealloc_error_status == 0);
+  assert(thread_state.mm_dealloc_error_status == 0);
 
   // make a big alloc
   MMTestStructBig* c = new MMTestStructBig;
@@ -893,13 +913,15 @@ void MemoryManager::Test_StandardAllocDealloc() {
   assert(arena_header->num_cells_occupied == 1);
   assert(arena_header->next == nullptr);
   assert(arena_header->dummy_guard == VALID_ARENA_HEADER_MARKER);
-  assert(MemoryManager::thread_state.mm_alloc_error_status == 0);
+  assert(thread_state.mm_alloc_error_status == 0);
   delete a;
   delete c;
 }
 
 void MemoryManager::Test_StochasticAllocDealloc() {
   // for this test we want to pseudo-randomly allocate a mass amount of different sizes and validate them
+  MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
+  MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
   MemoryManager::ClearAllocErrors();
   MemoryManager::ClearDeallocErrors();
   const int num_allocs = 10000;
@@ -925,7 +947,7 @@ void MemoryManager::Test_StochasticAllocDealloc() {
     assert(alloc_list[i] != nullptr);
     uint32_t arena_index = 0;
     uint32_t cell_size_without_header = CalculateCellSizeAndArenaIndexForAllocation(alloc_size, arena_index);
-    ArenaCollection* arena_collection = MemoryManager::thread_state.thread_sandbox->arenas[arena_index];
+    ArenaCollection* arena_collection = thread_state.thread_sandbox->arenas[arena_index];
     unsigned char* data_char = reinterpret_cast<unsigned char*>(alloc_list[i]);
     // get the arena header from the cell header
     CellHeader* cell_header = reinterpret_cast<CellHeader*>(data_char - sizeof(CellHeader));
@@ -947,7 +969,7 @@ void MemoryManager::Test_StochasticAllocDealloc() {
       // before we deallocate, grab the arena for that allocation so we can watch it change before and after the deallocation
       uint32_t arena_index = 0;
       uint32_t cell_size_without_header = CalculateCellSizeAndArenaIndexForAllocation(size_list[j], arena_index);
-      ArenaCollection* arena_collection = MemoryManager::thread_state.thread_sandbox->arenas[arena_index];
+      ArenaCollection* arena_collection = thread_state.thread_sandbox->arenas[arena_index];
       unsigned char* data_char = reinterpret_cast<unsigned char*>(alloc_list[j]);
       // get the arena header from the cell header
       CellHeader* cell_header = reinterpret_cast<CellHeader*>(data_char - sizeof(CellHeader));
@@ -977,7 +999,7 @@ void MemoryManager::Test_StochasticAllocDealloc() {
     // before we deallocate, grab the arena for that allocation so we can watch it change before and after the deallocation
     uint32_t arena_index = 0;
     uint32_t cell_size_without_header = CalculateCellSizeAndArenaIndexForAllocation(size_list[i], arena_index);
-    ArenaCollection* arena_collection = MemoryManager::thread_state.thread_sandbox->arenas[arena_index];
+    ArenaCollection* arena_collection = thread_state.thread_sandbox->arenas[arena_index];
     unsigned char* data_char = reinterpret_cast<unsigned char*>(alloc_list[i]);
     // get the arena header from the cell header
     CellHeader* cell_header = reinterpret_cast<CellHeader*>(data_char - sizeof(CellHeader));
@@ -1003,6 +1025,8 @@ void MemoryManager::Test_StochasticAllocDealloc() {
 }
 
 void MemoryManager::Test_CrossThreadAllocDealloc() {
+  MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
+  MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
   struct MMTestStructTiny {
     uint64_t thing1;
   };
@@ -1028,8 +1052,8 @@ void MemoryManager::Test_CrossThreadAllocDealloc() {
   ThreadSandboxNode* sandbox = nullptr;
   {
     // NOTE: any time we walk the sandbox list we have to lock this mutex
-    std::lock_guard<std::mutex> guard(MemoryManager::global_state.sandbox_list_mutex);
-    sandbox = MemoryManager::global_state.thread_sandbox_linked_list;
+    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
+    sandbox = global_state.thread_sandbox_linked_list;
     int count_sandboxes = 0;
     while (sandbox) {
       count_sandboxes++;
@@ -1051,8 +1075,8 @@ void MemoryManager::Test_CrossThreadAllocDealloc() {
         // on the second thread, we've only made a deallocation, so it should NOT have any arena collections present
         assert(collection == nullptr);
       }
-      assert(MemoryManager::thread_state.mm_alloc_error_status == 0);
-      assert(MemoryManager::thread_state.mm_dealloc_error_status == 0);
+      assert(thread_state.mm_alloc_error_status == 0);
+      assert(thread_state.mm_dealloc_error_status == 0);
       sandbox = sandbox->next;
     }    
     assert(count_sandboxes == 2);
@@ -1064,11 +1088,8 @@ void MemoryManager::Test_CrossThreadAllocDealloc() {
 }
 
 void MemoryManager::Test_ErrorHandling() {  
-  // first find our thread sandbox
-  ThreadSandboxNode* prev_sandbox = nullptr;
-  if (!MemoryManager::thread_state.thread_id) {
-    MemoryManager::thread_state.thread_id = GET_CURRENT_THREAD_ID();
-  }
+  MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
+  MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
   // make an extremely large alloc with the default (exception throwing) version of new
   try {
     int64_t huge = 1000000000000000;
@@ -1089,6 +1110,8 @@ void MemoryManager::Test_ErrorHandling() {
 }
 
 void MemoryManager::PerfTest_AllocDealloc() {
+  MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
+  MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
   struct MMTestStructTiny {
     uint64_t thing1;
   };

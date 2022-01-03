@@ -181,7 +181,11 @@ public:
 
   // The global static system state across all threads
   struct GlobalState {
+    // global state constructor
     GlobalState();
+    GlobalState(GlobalState const&) = delete;
+    void operator= (GlobalState const&) = delete;
+    ~GlobalState();
     // thread_sandbox_linked_list is a linked list of sandboxes, one element per thread.
     // For threading each thread gets its own collection of memory arenas to manage in parallel. This reduces mutex locking overhead.
     // at the beginning of each arena in the collection is a header
@@ -191,17 +195,19 @@ public:
     ThreadSandboxNode* thread_sandbox_linked_list;
     // this mutex must be locked any time thread_sandbox_linked_list is accessed
     std::mutex sandbox_list_mutex;
-    unsigned int base_arena_index;
+    const unsigned int base_arena_index;
     unsigned int mm_global_error_status; /* nonzero means error */
   };
 
   // State that is global to individual threads
   struct ThreadState {
-    // thread constructor
+    // thread constructor 
     ThreadState();
+    ThreadState(ThreadState const&) = delete;
+    void operator= (ThreadState const&) = delete;
     // thread destructor, cleans up the memory allocated on this thread
     ~ThreadState();
-    int thread_id;
+    const int thread_id; // mostly used for caching the thread_id, not critical
     // the sandbox for this thread
     ThreadSandboxNode* thread_sandbox;
     unsigned int mm_dealloc_error_status; /* nonzero means error */
@@ -228,8 +234,7 @@ public:
   static void Test_StochasticAllocDealloc();
   static void PerfTest_AllocDealloc();  
 
-private:
-  static int GetCurrentThreadID();
+private:  
 
   static ThreadSandboxNode* AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id);
   static inline ThreadSandboxNode* FindSandboxForThread(unsigned int thread_id, ThreadSandboxNode*& last_node);
@@ -244,11 +249,10 @@ private:
   // process all the deallocation requests on this thread. returns zero on success, otherwise error code
   static int ProcessDeallocationRequests(ThreadSandboxNode* owning_sandbox);
 
-  ////// Global state across all threads ////////  
-  static GlobalState global_state;
-  ////// Each thread will have its own global state here //////   
-  static thread_local ThreadState thread_state;
-
+  // we need to ensure that global state is set up before any allocations happen these accessors guarantee that at runtime
+  static ThreadState& GetThreadState();
+  // we need to ensure that thread state is set up before any allocations happen these accessors guarantee that at runtime
+  static GlobalState& GetGlobalState();
 };
 
 #if _MSC_VER >= 1200
