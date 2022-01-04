@@ -26,3 +26,9 @@ Below is an example detailed view of a single arena. Notice that the whole arena
 The quickest way to use it with visual studio is to simply add the .h and .cpp files to your visual studio project alongside your source code. You can even put it in a subdirectory or parent directory and then in your visual studio project settings add an include path relative to your project with $(ProjectDir)/memorymanager for example. Then using the same relative path you can "add existing" with the source and header file to your solution explorer "Source Files" or "Header Files" filter. You should be good to go.
 
 Unit tests are included in the source as indicated. The included VS solution has a project inside it to run the tests.
+
+Linux:
+Under linux there is a folder to compile a test program in the MemoryManagerGCC/MemoryManagerTestsGCC subfolder. 
+Ensure that you are running glibc version 2.3 or newer. Type ldd --version to verify this.
+To build the test program simply type 'make' and run the main program
+See the makefile and README there for more details on build parameters like march, etc.
