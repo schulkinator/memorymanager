@@ -155,7 +155,7 @@ struct alignas(BYTE_ALIGNMENT) _thread_alloc_header_ {
 //#define THREAD_ID_HASHED_ADDRESS reinterpret_cast<void*>(MemoryManager::GetCurrentThreadID() % MAX_SUPPORTED_THREADS) * 1000
 inline void* Unix_Kmalloc(size_t sz) {
   //_thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + sz), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0));  // map uninitialized doesn't seem to work
-  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + sz), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)); // TODO: not sure if MAP_SHARED should be MAP_PRIVATE
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + sz), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)); // TODO: not sure if MAP_SHARED should be MAP_PRIVATE
   if (header != MAP_FAILED) {
     header->alloc_size = sz;
     header->usage_flags = 0x1;
@@ -177,7 +177,7 @@ inline void* Unix_Realloc(void* p, size_t sz) {
   return nullptr;
 }
 inline void* Unix_Kcalloc(size_t n, size_t sz) {  
-  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + (n * sz)), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)); // TODO: not sure if MAP_SHARED should be MAP_PRIVATE
+  _thread_alloc_header_* header = reinterpret_cast<_thread_alloc_header_*>(mmap(NULL, (sizeof(_thread_alloc_header_) + (n * sz)), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)); // TODO: not sure if MAP_SHARED should be MAP_PRIVATE
   if (header != MAP_FAILED) {
     header->alloc_size = n * sz;
     header->usage_flags = 0x1;
