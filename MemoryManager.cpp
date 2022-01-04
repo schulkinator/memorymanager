@@ -278,6 +278,7 @@ void MemoryManager::ClearDeallocErrors() {
 MemoryManager::GlobalState::GlobalState() :
   base_arena_index(COUNT_NUM_TRAILING_ZEROES_UINT32(BYTE_ALIGNMENT)),
   thread_sandbox_linked_list(nullptr),
+  thread_sandbox_linked_list_size(0),
   mm_global_error_status(0) {
 #ifdef _WIN32
   GetSystemInfo(&mm_sys_info);
@@ -322,9 +323,12 @@ MemoryManager::ThreadState::ThreadState() :
 }
 // thread destructor gets called when the thread exits
 MemoryManager::ThreadState::~ThreadState() {
-  MemoryManager::ThreadShutdown();
+  int shutdown_code = MemoryManager::ThreadShutdown();
 #ifdef _WIN32
-  HeapDestroy(mm_thread_heap);
+  // do not destroy the thread heap if there was an abnormal shutdown situation
+  if (shutdown_code == 0) {
+    HeapDestroy(mm_thread_heap);
+  }
 #endif
 }
 
@@ -367,6 +371,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
         return nullptr;
       }
       thread_state.thread_sandbox = global_state.thread_sandbox_linked_list;
+      global_state.thread_sandbox_linked_list_size++;
     }
   }
   ThreadSandboxNode* prev_sandbox = nullptr;
@@ -385,6 +390,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
       error_handler();
       return nullptr;
     }
+    global_state.thread_sandbox_linked_list_size++;
   }
   // now we can process the sandbox
   // first, do we have any cross-thread dealloc requests to handle?
@@ -443,14 +449,10 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   // track this arena as having a recent cell allocation
   arena_collection->recent_alloc_arena = arena_header;
   // we've found an arena with unoccupied cells, find a cell to occupy and mark it  
-  //  - if we invert the bits of cell_occupation_bits use COUNT_NUM_TRAILING_ZEROES_UINT64, that would find the index of the first unset bit (the first empty cell)
+  //  - if we invert the bits of cell_occupation_bits and use COUNT_NUM_TRAILING_ZEROES_UINT64, that would find the index of the first unset bit (the first empty cell)
   //unsigned long long cell_occupation_bits = arena_header->cell_occupation_bits;
   // NOTE: we don't have to worry about feeding COUNT_NUM_TRAILING_ZEROES_UINT64 a zero value here (causing it to blow up) because above we guarantee that we don't consider full arenas, ~(all bits set) is zero
-  unsigned int cell_index = COUNT_NUM_TRAILING_ZEROES_UINT64(~arena_header->cell_occupation_bits);
-  //while ((cell_occupation_bits & 1ULL) == 1) {
-  //  cell_occupation_bits = cell_occupation_bits >> 1;
-  //  cell_index++;
-  //}
+  unsigned int cell_index = COUNT_NUM_TRAILING_ZEROES_UINT64(~arena_header->cell_occupation_bits);  
   // found it, mark it as occupied
   arena_header->num_cells_occupied++;
   arena_header->cell_occupation_bits = arena_header->cell_occupation_bits | (1ULL << cell_index);
@@ -513,19 +515,19 @@ MemoryManager::ThreadSandboxNode* MemoryManager::FindSandboxForThread(unsigned i
 void MemoryManager::Deallocate(void* data, size_t size) {
   if (data == nullptr) {
     return;
-  }
+  }  
   // first, identify if this is an outside system allocation
   // it should always be safe to read into the memory behind the given pointer because all scenarios are:
   // 1.) it was a large allocation and you'll read into the "outside system marker" (this is the first thing we check for)
   // 2.) you're going to read into a previous cell's memory
   // 3.) you'll read into the arena header's dummy guard (that's why it's there)  
   unsigned char* behind_ptr = reinterpret_cast<unsigned char*>(data) - BYTE_ALIGNMENT;
-  unsigned int* marker_ptr = reinterpret_cast<unsigned int*>(behind_ptr);
+  unsigned int* marker_ptr = reinterpret_cast<unsigned int*>(behind_ptr);  
   if (size > MAX_CELL_SIZE || (*marker_ptr == OUTSIDE_SYSTEM_MARKER)) {
     // beyond MAX_ALLOCATION_SIZE we don't care, we're more concerned about small allocations fragmenting memory     
     KFREE(behind_ptr);
     return;
-  }
+  }  
   // very first thing we must do before deallocating is get the thread state and global state (uses C++ static initialization-on-first-use)
   MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
   MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
@@ -541,6 +543,7 @@ void MemoryManager::Deallocate(void* data, size_t size) {
     // only one thread at a time is allowed to make a new sandbox
     std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
     thread_state.thread_sandbox = AllocateNewThreadSandbox(prev_sandbox, thread_state.thread_id);
+    global_state.thread_sandbox_linked_list_size++;
   }
   if (!thread_state.thread_sandbox) {
     // we didn't find the sandbox for this thread. Something really bad must've happened!    
@@ -706,13 +709,12 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   return arena_header;
 }
 
-void MemoryManager::ThreadShutdown() {
+int MemoryManager::ThreadShutdown() {
   // this shutdown runs per-thread. (Each thread shuts down for itself.)
-  // TODO: currently, we just have each thread free its own arena memory. 
-  //     but if we have a lot of threads coming and going, this actually causes fragmentation of its own 
+  // NOTE: currently, we have each thread free its own arena memory. 
+  //     if we have a lot of threads coming and going, this actually causes fragmentation of its own 
   //     (because it blasted a big hole in the contiguous heap memory where this thread had memory allocated)
-  //     So to fix this, we need an exiting thread to transfer ownership of its memory to another active thread, 
-  //     and then only the last thread exiting does the actual free()
+  //     but this should be mostly okay because those should be large page-sized holes that another thread could occupy later.
   // very first thing we must do is get the thread state and global state (uses C++ static initialization-on-first-use)
   MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
   MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
@@ -723,7 +725,7 @@ void MemoryManager::ThreadShutdown() {
     thread_state.thread_sandbox = FindSandboxForThread(thread_state.thread_id, prev_sandbox);
   }
   if (!thread_state.thread_sandbox) {
-    return;
+    return MEMMAN_THREAD_SHUTDOWN_CODE_ALREADY_RELEASED;
   }
   // process queued deallocs from other threads if there are any waiting
   ProcessDeallocationRequests(thread_state.thread_sandbox);
@@ -777,7 +779,7 @@ void MemoryManager::ThreadShutdown() {
   // because something is either still in use or there was a memory leak or some static destructor hasn't completed
   if (thread_state.thread_sandbox->derelict) {
     ////// we can't free this thread's memory normally, something is leaking or still in use ////////
-    return;
+    return MEMMAN_THREAD_SHUTDOWN_CODE_DERELICT;
   }
   {
     // deallocate the dealloc_queue for this thread
@@ -810,16 +812,16 @@ void MemoryManager::ThreadShutdown() {
       // it was the head of the linked list, so fix that
       global_state.thread_sandbox_linked_list = curr_node->next;
     }
+    global_state.thread_sandbox_linked_list_size--;
+    // the last thread to exit nulls out the linked list
+    if (global_state.thread_sandbox_linked_list_size == 0) {
+      global_state.thread_sandbox_linked_list = nullptr;
+    }
   }
+  // free the thread sandbox structure
   KFREE(thread_state.thread_sandbox);
-  thread_state.thread_sandbox = nullptr;
-  // TODO: we need to change this so that the last thread to exit destroys the main linked list of sandboxes
-  // this should be safe as long as each thread already has its own thread-local sandbox cached
-  //std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
-  //if (global_state.thread_sandbox_linked_list != nullptr) {    
-  //  KFREE(global_state.thread_sandbox_linked_list);
-  //  global_state.thread_sandbox_linked_list = nullptr;
-  //}
+  thread_state.thread_sandbox = nullptr;  
+  return 0;
 }
 
 void MemoryManager::Test_StandardAllocDealloc() {

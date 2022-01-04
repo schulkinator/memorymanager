@@ -76,6 +76,9 @@ void operator delete[](void* p, size_t size, const std::nothrow_t&) noexcept;
 void operator delete[](void* p);
 #endif
 
+#define MEMMAN_THREAD_SHUTDOWN_CODE_DERELICT              0x0001
+#define MEMMAN_THREAD_SHUTDOWN_CODE_ALREADY_RELEASED      0x0002
+
 class MemoryManager {
 public:
 
@@ -193,7 +196,8 @@ public:
     // Thread memory sandboxes do not get allocated until that particular thread makes an allocation, so there is theoretically an unlimited amount of threads.
     // Same with arenas, they are not allocated until they are needed (lazy allocation).
     ThreadSandboxNode* thread_sandbox_linked_list;
-    // this mutex must be locked any time thread_sandbox_linked_list is accessed
+    unsigned int thread_sandbox_linked_list_size;
+    // this mutex must be locked any time thread_sandbox_linked_list or thread_sandbox_linked_list_size is accessed
     std::mutex sandbox_list_mutex;
     const unsigned int base_arena_index;
     unsigned int mm_global_error_status; /* nonzero means error */
@@ -225,7 +229,9 @@ public:
   static void ClearDeallocErrors();
 
   // deallocate all thread memory and shut down
-  static void ThreadShutdown();
+  // returns zero on normal shutdown, 
+  // otherwise returns codes that signal situations like derelict memory encountered, ie: THREAD_SHUTDOWN_CODE_DERELICT
+  static int ThreadShutdown();
 
   // Unit tests
   static void Test_StandardAllocDealloc();
