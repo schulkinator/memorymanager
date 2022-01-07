@@ -44,7 +44,7 @@
 #endif
 
 // Memory allocation values
-#define MAX_CELL_SIZE 8388608 /* anything above this cell size is not put in an arena by the system */
+#define MAX_CELL_SIZE 8388608 /* anything above this cell size is not put in an arena by the system. must be a power of 2! */
 #define MAX_ARENA_SIZE 8388608 /* we do not create arenas larger than this size (not including cell headers). the cell capacity of an arena will be reduced if needed so that it satisfies this restriction*/
 #define MAX_CELLS_PER_ARENA 64 /* there can only be up to 64 cells in an arena. (but there can be less) */
 #define OUTSIDE_SYSTEM_MARKER 0xBACBAA55
@@ -452,7 +452,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   //  - if we invert the bits of cell_occupation_bits and use COUNT_NUM_TRAILING_ZEROES_UINT64, that would find the index of the first unset bit (the first empty cell)
   //unsigned long long cell_occupation_bits = arena_header->cell_occupation_bits;
   // NOTE: we don't have to worry about feeding COUNT_NUM_TRAILING_ZEROES_UINT64 a zero value here (causing it to blow up) because above we guarantee that we don't consider full arenas, ~(all bits set) is zero
-  unsigned int cell_index = COUNT_NUM_TRAILING_ZEROES_UINT64(~arena_header->cell_occupation_bits);  
+  unsigned int cell_index = static_cast<unsigned int>(COUNT_NUM_TRAILING_ZEROES_UINT64(~arena_header->cell_occupation_bits));  
   // found it, mark it as occupied
   arena_header->num_cells_occupied++;
   arena_header->cell_occupation_bits = arena_header->cell_occupation_bits | (1ULL << cell_index);
@@ -639,11 +639,15 @@ MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(Thread
   // allocate the arena index dimension
   // first calculate how many arenas we need based on arenas that have power-of-two size cells in them, doubling each time until we hit the max cell size
   // this will include an arena with 1-byte cells which isn't very useful, so we subtract off the first couple
-  unsigned int arenas_needed = static_cast<unsigned int>(log(MAX_CELL_SIZE) / log(2.0f));
+  //unsigned int arenas_needed = static_cast<unsigned int>(log(MAX_CELL_SIZE) / log(2.0f));
+  // if we're guaranteed that MAX_CELL_SIZE is a power of two, 
+  // then we can use a shortcut to calculate the arena index by counting the number of trailing zeroes in the cell size
+  unsigned int arenas_needed = COUNT_NUM_TRAILING_ZEROES_UINT32(MAX_CELL_SIZE);
   // it will screw up byte alignment if we allow arenas that have cell sizes < BYTE_ALIGNMENT
   // so we need to ignore the first couple powers of two below a cell size of BYTE_ALIGNMENT
-  unsigned int ignore_first_n = static_cast<unsigned int>(((log(BYTE_ALIGNMENT) / log(2.0f)) - 1));
-  arenas_needed -= ignore_first_n;
+  //unsigned int ignore_first_n = static_cast<unsigned int>(((log(BYTE_ALIGNMENT) / log(2.0f)) - 1));
+  //arenas_needed -= ignore_first_n;
+  arenas_needed -= (MemoryManager::GetGlobalState().base_arena_index - 1);
   // now we know how many arenas we need, allocate the array of pointers to their collections
   // since we use calloc, everything will be zero initialized for us
   thread_sandbox->arenas = reinterpret_cast<ArenaCollection**>(KCALLOC(arenas_needed, sizeof(ArenaCollection*)));
