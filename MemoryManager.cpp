@@ -43,6 +43,28 @@
 #pragma warning(disable : 28251)
 #endif
 
+// which CPU bitness are we compiling for?
+#if defined(_MSC_VER) || (defined(__INTEL_COMPILER) && defined(_WIN32))
+#if defined(_M_X64)
+#define BITNESS 64
+#define LONG_SIZE 4
+#else
+#define BITNESS 32
+#define LONG_SIZE 4
+#endif
+#elif defined(__clang__) || defined(__INTEL_COMPILER) || defined(__GNUC__)
+#if defined(__x86_64)
+#define BITNESS 64
+#else
+#define BITNESS 32
+#endif
+#if __LONG_MAX__ == 2147483647L
+#define LONG_SIZE 4
+#else
+#define LONG_SIZE 8
+#endif
+#endif
+
 // Memory allocation values
 #define MAX_CELL_SIZE 8388608 /* anything above this cell size is not put in an arena by the system. must be a power of 2! */
 #define MAX_ARENA_SIZE 8388608 /* we do not create arenas larger than this size (not including cell headers). the cell capacity of an arena will be reduced if needed so that it satisfies this restriction*/
@@ -64,12 +86,6 @@
   #define COUNT_NUM_TRAILING_ZEROES_UINT32(bits) __builtin_ctz(bits)
 #endif
 
-#if defined _M_X64 || defined _M_IX86 || defined __x86_64__
-#define COUNT_NUM_TRAILING_ZEROES_UINT64(bits) _tzcnt_u64(bits) /* This is an x86 specific BMI instruction intrinsic */
-#else
-#define COUNT_NUM_TRAILING_ZEROES_UINT64(bits) __builtin_ctz(bits)
-#endif
-
 // Macro to count the leading number of zeros before the most significant bit.
 #if defined _M_X64 || defined _M_IX86 || defined __x86_64__
   #define COUNT_NUM_LEADING_ZEROES_UINT32(bits) _lzcnt_u32(bits) /* This is an x86 specific BMI instruction intrinsic */
@@ -77,16 +93,10 @@
   #define COUNT_NUM_LEADING_ZEROES_UINT32(bits) __builtin_clzl(bits)
 #endif
 
-#if defined _M_X64 || defined _M_IX86 || defined __x86_64__
-#define COUNT_NUM_LEADING_ZEROES_UINT64(bits) _lzcnt_u64(bits) /* This is an x86 specific BMI instruction intrinsic */
-#else
-#define COUNT_NUM_LEADING_ZEROES_UINT64(bits) __builtin_clzll(bits)
-// I've also seen this as _BitScanReverse64 in some places
-#endif
 
 // intrinsic based version for 64bit uint
-#define NEXT_POW2_UINT64(n) \
-n == 1 ? 1 : 1<<(64-COUNT_NUM_LEADING_ZEROES_UINT64(n-1))
+//#define NEXT_POW2_UINT64(n) \
+//n == 1 ? 1 : 1<<(64-COUNT_NUM_LEADING_ZEROES_UINT64(n-1))
 
 // intrinsic based version for 32bit uint
 #define NEXT_POW2_UINT32(n) \
@@ -341,7 +351,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     // beyond MAX_ALLOCATION_SIZE we don't care, we're more concerned about small allocations fragmenting memory    
     // stamp down a header to mark it as outside memory
     unsigned char* p = reinterpret_cast<unsigned char*>(KMALLOC(size + BYTE_ALIGNMENT));
-    if (reinterpret_cast<int64_t>(p) <= 0) {
+    if (!p) {
       // allocation failed
       error_handler();
       return nullptr;
@@ -406,7 +416,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     // no arena collection was allocated for this allocation size yet, allocate it now    
     // since we use calloc, everything will be zero initialized for us
     arena_collection = reinterpret_cast<ArenaCollection*>(KCALLOC(1, sizeof(ArenaCollection)));
-    if (reinterpret_cast<int64_t>(arena_collection) <= 0) {
+    if (!arena_collection) {
       // arena collection allocation failed
       error_handler();
       return nullptr;
@@ -416,7 +426,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     arena_collection->derelict = false;
     thread_state.thread_sandbox->arenas[arena_index] = arena_collection;
     arena_header = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
-    if (reinterpret_cast<int64_t>(arena_header) <= 0) {
+    if (!arena_header) {
       // the allocation failed
       error_handler();
       return nullptr;
@@ -438,7 +448,7 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
     if (!arena_header->next) {
       // there's no next arena, allocate a new one
       arena_header->next = AllocateArenaOfMemory(cell_size_without_header, BYTE_ALIGNMENT, arena_collection);
-      if (reinterpret_cast<int64_t>(arena_header->next) <= 0) {
+      if (!arena_header->next) {
         // the allocation failed
         error_handler();
         return nullptr;
@@ -452,10 +462,18 @@ void* MemoryManager::Allocate(size_t size, void (*error_handler)()) {
   //  - if we invert the bits of cell_occupation_bits and use COUNT_NUM_TRAILING_ZEROES_UINT64, that would find the index of the first unset bit (the first empty cell)
   //unsigned long long cell_occupation_bits = arena_header->cell_occupation_bits;
   // NOTE: we don't have to worry about feeding COUNT_NUM_TRAILING_ZEROES_UINT64 a zero value here (causing it to blow up) because above we guarantee that we don't consider full arenas, ~(all bits set) is zero
-  unsigned int cell_index = static_cast<unsigned int>(COUNT_NUM_TRAILING_ZEROES_UINT64(~arena_header->cell_occupation_bits));  
+  unsigned int cell_index = 0;
+  if (arena_header->cell_occupation_bits_bank0 != 0xFFFFFFFF) {
+    cell_index = static_cast<unsigned int>(COUNT_NUM_TRAILING_ZEROES_UINT32(~arena_header->cell_occupation_bits_bank0));
+    arena_header->cell_occupation_bits_bank0 = arena_header->cell_occupation_bits_bank0 | (1U << cell_index);
+  }
+  else {
+    cell_index = static_cast<unsigned int>(COUNT_NUM_TRAILING_ZEROES_UINT32(~arena_header->cell_occupation_bits_bank1));
+    arena_header->cell_occupation_bits_bank1 = arena_header->cell_occupation_bits_bank1 | (1U << cell_index);
+    cell_index += 32; // because this is on the second bank (overal starting at bit #32)
+  }
   // found it, mark it as occupied
   arena_header->num_cells_occupied++;
-  arena_header->cell_occupation_bits = arena_header->cell_occupation_bits | (1ULL << cell_index);
   CellHeader* cell_header = reinterpret_cast<CellHeader*>(arena_header->arena_start + (cell_index * (sizeof(CellHeader) + arena_header->cell_size_bytes)));
   // the pointer we return is at the appropriate cell, past the header of the cell
   unsigned char* ptr = arena_header->arena_start + (cell_index * (sizeof(CellHeader) + arena_header->cell_size_bytes)) + sizeof(CellHeader);
@@ -589,8 +607,13 @@ void MemoryManager::Deallocate(void* data, size_t size) {
   // ok we found the arena it's in. turn off the bit in the arena header to mark it as unoccupied
   unsigned char* cell_start = reinterpret_cast<unsigned char*>(data) - sizeof(CellHeader);
   unsigned int bit_position_for_cell = static_cast<unsigned int>((cell_start - arena_header->arena_start) / cell_size_with_header);
-  unsigned long long bit = ~(1ULL << bit_position_for_cell);
-  arena_header->cell_occupation_bits = arena_header->cell_occupation_bits & bit;
+  if (bit_position_for_cell < 32) {
+    unsigned int bit = ~(1U << (bit_position_for_cell));
+    arena_header->cell_occupation_bits_bank0 = arena_header->cell_occupation_bits_bank0 & bit;
+  } else {
+    unsigned int bit = ~(1U << (bit_position_for_cell - 32));
+    arena_header->cell_occupation_bits_bank1 = arena_header->cell_occupation_bits_bank1 & bit;
+  }
 }
 
 int MemoryManager::MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_sandbox, void* data, size_t size) {
@@ -670,7 +693,7 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   // each cell contains: a pointer to the arena header, some guard padding, then the cell data itself
   size_t arena_size = header_size + alignment_bytes + ((sizeof(CellHeader) + cell_size_without_header_bytes) * cell_capacity);
   unsigned char* raw_arena = reinterpret_cast<unsigned char*>(KMALLOC(arena_size));
-  if (reinterpret_cast<int64_t>(raw_arena) <= 0) {
+  if (!raw_arena) {
     return reinterpret_cast<ArenaHeader*>(raw_arena);
   }
 #if _MSC_VER >= 1200
@@ -688,13 +711,21 @@ MemoryManager::ArenaHeader* MemoryManager::AllocateArenaOfMemory(size_t cell_siz
   arena_header->cell_capacity = cell_capacity;
   // this works based on the property that a power of two alignment number like 8 for example (1000 in binary)
   // will be 0111 once we subtract 1, giving us our mask.
+#if BITNESS == 64
   uint64_t padding_addr_mask = static_cast<uint64_t>(alignment_bytes - 1U);
+#else
+  uint32_t padding_addr_mask = static_cast<uint32_t>(alignment_bytes - 1U);
+#endif
   // figure out how many bytes past the header we can start the arena in order to be byte-aligned
   unsigned char* raw_arena_past_header = raw_arena + header_size;
   // any bits of the address that land within the mask area will signal that raw_arena_past_header is not on an address that is a multiple of alignment_bytes
   // and in fact tells us how many bytes past that multiple it is. Said another way, if raw_arena_past_header is at an address that is
   // a multiple of alignment_bytes, then all of the bits to the right of the most significant bit in alignment_bytes for the raw_arena_past_header address should be zero
+#if BITNESS == 64
   uint64_t masked_addr_past_header = (padding_addr_mask & reinterpret_cast<uint64_t>(raw_arena_past_header));
+#else
+  uint32_t masked_addr_past_header = (padding_addr_mask & reinterpret_cast<uint32_t>(raw_arena_past_header));
+#endif
   // so for example, if masked_addr_past_header indicates we're 1 byte past a desired alignment, we need to move forward (alignment_bytes - 1) to land on an alignment boundary
   arena_header->arena_collection = arena_collection;
   arena_header->padding_size_bytes = static_cast<unsigned int>((alignment_bytes - masked_addr_past_header) % alignment_bytes);
@@ -982,7 +1013,8 @@ void MemoryManager::Test_StochasticAllocDealloc() {
       assert(cell_header->dummy_guard == VALID_CELL_HEADER_MARKER);
       ArenaHeader* arena = cell_header->arena_header;
       auto num_cells_occupied_before = arena->num_cells_occupied;
-      auto cell_occupation_bits_before = arena->cell_occupation_bits;
+      auto cell_occupation_bits_before_bank0 = arena->cell_occupation_bits_bank0;
+      auto cell_occupation_bits_before_bank1 = arena->cell_occupation_bits_bank1;
       // arena collection is valid
       assert(arena_collection != nullptr);
       // do the deallocation
@@ -992,7 +1024,7 @@ void MemoryManager::Test_StochasticAllocDealloc() {
       // the number of occupied cells went down by one
       assert(arena->num_cells_occupied == (num_cells_occupied_before - 1));
       // cell occupation bits changed
-      assert(arena->cell_occupation_bits != cell_occupation_bits_before);
+      assert(arena->cell_occupation_bits_bank0 != cell_occupation_bits_before_bank0 || arena->cell_occupation_bits_bank1 != cell_occupation_bits_before_bank1);
       // null out that element so we dont try to dealloc it again
       alloc_list[j] = nullptr;
     }
@@ -1012,7 +1044,8 @@ void MemoryManager::Test_StochasticAllocDealloc() {
     assert(cell_header->dummy_guard == VALID_CELL_HEADER_MARKER);
     ArenaHeader* arena = cell_header->arena_header;
     auto num_cells_occupied_before = arena->num_cells_occupied;
-    auto cell_occupation_bits_before = arena->cell_occupation_bits;
+    auto cell_occupation_bits_before_bank0 = arena->cell_occupation_bits_bank0;
+    auto cell_occupation_bits_before_bank1 = arena->cell_occupation_bits_bank1;
     // arena collection is valid
     assert(arena_collection != nullptr);
     // do the deallocation
@@ -1022,7 +1055,7 @@ void MemoryManager::Test_StochasticAllocDealloc() {
     // the number of occupied cells went down by one
     assert(arena->num_cells_occupied == (num_cells_occupied_before - 1));
     // cell occupation bits changed
-    assert(arena->cell_occupation_bits != cell_occupation_bits_before);
+    assert(arena->cell_occupation_bits_bank0 != cell_occupation_bits_before_bank0 || arena->cell_occupation_bits_bank1 != cell_occupation_bits_before_bank1);
     // null out that element so we dont try to dealloc it again
     alloc_list[i] = nullptr;
   }

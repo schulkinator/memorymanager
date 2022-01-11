@@ -145,7 +145,8 @@ public:
     // 64bit value each bit represents a cell of memory in the arena marking it as occupied or not
     // The lower-order bits in this value represent cells at the beginnning of the arena
     // the higher-order bits in this value represent cells at the end of the arena
-    unsigned long long cell_occupation_bits;
+    unsigned int cell_occupation_bits_bank0; // 32bit least-significant occupancy bit set markers
+    unsigned int cell_occupation_bits_bank1; // 32bit next most significant occupancy bit set markers
     unsigned int num_cells_occupied;
     unsigned int cell_capacity;
     // arena_start will point to the start of the data arena (ie: the first cell)
