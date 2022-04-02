@@ -531,25 +531,10 @@ void MemoryManager::Deallocate(void* data, size_t size) {
   // very first thing we must do before deallocating is get the thread state and global state (uses C++ static initialization-on-first-use)
   MemoryManager::ThreadState& thread_state = MemoryManager::GetThreadState();
   MemoryManager::GlobalState& global_state = MemoryManager::GetGlobalState();
-  // next we need to identify which sandbox this memory belongs to and if this is a cross-thread deallocation  
-  ThreadSandboxNode* prev_sandbox = nullptr;
-  if (!thread_state.thread_sandbox) {
-    // we need a mutex lock any time we walk the full sandbox list since other threads can alter it if they are shut down
-    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
-    thread_state.thread_sandbox = FindSandboxForThread(thread_state.thread_id, prev_sandbox);
-  }
-  if (!thread_state.thread_sandbox) {
-    // we did not find a sandbox for this thread, we must make one
-    // only one thread at a time is allowed to make a new sandbox
-    std::lock_guard<std::mutex> guard(global_state.sandbox_list_mutex);
-    thread_state.thread_sandbox = AllocateNewThreadSandbox(prev_sandbox, thread_state.thread_id);
-    global_state.thread_sandbox_linked_list_size++;
-  }
-  if (!thread_state.thread_sandbox) {
-    // we didn't find the sandbox for this thread. Something really bad must've happened!    
-    thread_state.mm_dealloc_error_status |= 1;
-    return;
-  }
+  // For deallocations, it's not really important that we have a reference to the thread sandbox for the calling thread
+  // since we are more concerned about the thread sandbox that actually owns this memory.
+  // If the thread sandbox that owns this memory is the same as the thread sandbox for the calling thread then great! We can make a normal deallocation.
+  // If they are different threads then we must make a cross-thread deallocation.
   // we can look up the arena directly here by looking in the cell header
   // inside the cell header is a pointer to the arena header
   // are we authorized to deallocate on this thread?
