@@ -1069,8 +1069,10 @@ void MemoryManager::Test_CrossThreadAllocDealloc() {
       assert(thread_state.mm_alloc_error_status == 0);
       assert(thread_state.mm_dealloc_error_status == 0);
       sandbox = sandbox->next;
-    }    
-    assert(count_sandboxes == 2);
+    }
+    // on the second thread (t1), we've only made a deallocation, no allocations. So there was no opportunity for a second sandbox to be created. 
+    // Therefore there should only be one sandbox.
+    assert(count_sandboxes == 1);
   }
   // now allow the t1 thread to exit
   t1_allowed_exit = true;
