@@ -597,7 +597,7 @@ int MemoryManager::MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_san
       // We have to use the global heap here because otherwise we're allocating memory from an alien thread's heap and then when we shut down the deallocating thread tries to free memory that isn't in its own heap
       new_queue = reinterpret_cast<DeallocRequest*>(GLOBAL_KCALLOC(new_capacity, sizeof(DeallocRequest)));
     }
-    if (new_queue <= 0) {
+    if (!new_queue) {
       return 1;
     }
     owning_sandbox->dealloc_queue = new_queue;
@@ -614,7 +614,7 @@ int MemoryManager::MakeDeallocRequestOnOtherThread(ThreadSandboxNode* owning_san
 MemoryManager::ThreadSandboxNode* MemoryManager::AllocateNewThreadSandbox(ThreadSandboxNode* tail_of_list, unsigned int thread_id) {
   // since we use calloc, everything will be zero initialized for us
   ThreadSandboxNode* thread_sandbox = reinterpret_cast<ThreadSandboxNode*>(KCALLOC(1, sizeof(ThreadSandboxNode)));
-  if (thread_sandbox <= 0) {
+  if (!thread_sandbox) {
     // allocation failed
     return thread_sandbox;
   }
@@ -919,12 +919,12 @@ void MemoryManager::Test_StochasticAllocDealloc() {
   // have to use calloc so that we avoid using the memory manager for this test code
   unsigned char** alloc_list = static_cast<unsigned char**>(KCALLOC(num_allocs, sizeof(unsigned char*)));
   unsigned int* size_list = static_cast<unsigned int*>(KCALLOC(num_allocs, sizeof(unsigned int)));
-  assert(alloc_list > 0);
-  if (alloc_list <= 0) {
+  assert(alloc_list != nullptr);
+  if (!alloc_list) {
     return;
   }
-  assert(size_list > 0);
-  if (size_list <= 0) {
+  assert(size_list != nullptr);
+  if (!size_list) {
     return;
   }
   // allocate and hold on to the memory
